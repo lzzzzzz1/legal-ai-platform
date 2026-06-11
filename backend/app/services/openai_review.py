@@ -11,7 +11,7 @@ from app.schemas.review import ReviewResponse
 load_dotenv()
 
 BAILIAN_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-BAILIAN_DEFAULT_MODEL = "qwen-plus"
+BAILIAN_DEFAULT_MODEL = "qwen-max"
 MAX_CONTRACT_CHARS = 60000
 
 SYSTEM_PROMPT = (

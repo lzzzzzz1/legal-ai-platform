@@ -1,7 +1,8 @@
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.services.openai_review import parse_review_response
+from app.services.openai_review import parse_review_response, review_contract_text
 
 
 def test_parse_review_response_accepts_risks_object() -> None:
@@ -38,3 +39,13 @@ def test_parse_review_response_rejects_unknown_level() -> None:
             ),
             filename="contract.docx",
         )
+
+
+def test_review_contract_text_requires_dashscope_api_key(monkeypatch) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        review_contract_text(contract_text="合同文本", filename="contract.docx")
+
+    assert exc_info.value.status_code == 503
+    assert "DASHSCOPE_API_KEY" in exc_info.value.detail
