@@ -159,7 +159,7 @@ export default function App() {
             LA
           </span>
           <div>
-            <strong>Legal AI Platform</strong>
+            <strong>Legal AI</strong>
             <span>合同审查工作台</span>
           </div>
         </div>
@@ -174,7 +174,7 @@ export default function App() {
         <aside className="control-panel">
           <div className="panel-heading">
             <span className="status-chip">RAG 已启用</span>
-            <h1>上传合同，获得带法条依据的风险审查。</h1>
+            <h1>上传合同，生成带法条依据的审查结果。</h1>
             <p>系统会抽取合同文本，检索法规库，并返回风险提示、修改建议和参考条文。</p>
           </div>
 

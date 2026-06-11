@@ -65,32 +65,39 @@ button:not(:disabled):active {
   justify-content: space-between;
   gap: 20px;
   max-width: 1320px;
-  min-height: 68px;
+  min-height: 64px;
   margin: 0 auto 22px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: rgb(251 252 251 / 88%);
-  padding: 12px 14px;
+  padding: 10px 14px;
   box-shadow: 0 18px 52px rgb(37 49 43 / 8%);
 }
 
 .brand-block {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
 .brand-mark {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   place-items: center;
-  border-radius: 12px;
-  background: var(--accent);
+  border: 1px solid rgb(255 255 255 / 42%);
+  border-radius: 11px;
+  background:
+    linear-gradient(145deg, rgb(255 255 255 / 14%), transparent 46%),
+    var(--accent);
   color: #ffffff;
-  font-size: 0.78rem;
-  font-weight: 800;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 18%),
+    0 8px 18px rgb(20 92 61 / 16%);
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
 }
 
 .brand-block strong,
@@ -100,12 +107,14 @@ button:not(:disabled):active {
 
 .brand-block strong {
   color: var(--ink);
+  font-size: 0.92rem;
+  line-height: 1.1;
 }
 
 .brand-block span,
 .system-strip {
   color: var(--muted);
-  font-size: 0.86rem;
+  font-size: 0.82rem;
 }
 
 .system-strip {
@@ -152,7 +161,7 @@ button:not(:disabled):active {
 
 .panel-heading {
   display: grid;
-  gap: 14px;
+  gap: 12px;
 }
 
 .status-chip {
@@ -174,11 +183,13 @@ p {
 }
 
 h1 {
-  max-width: 13ch;
+  max-width: 12em;
   color: var(--ink);
-  font-size: clamp(2.1rem, 5vw, 4.5rem);
+  font-size: clamp(1.95rem, 2.45vw, 2.8rem);
   font-weight: 780;
-  line-height: 0.98;
+  line-height: 1.12;
+  letter-spacing: 0;
+  text-wrap: balance;
 }
 
 .panel-heading p,
@@ -666,7 +677,8 @@ h2 {
   }
 
   h1 {
-    max-width: 15ch;
+    max-width: 12em;
+    font-size: clamp(2rem, 8vw, 3.1rem);
   }
 }
 
