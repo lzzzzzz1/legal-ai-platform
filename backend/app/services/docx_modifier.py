@@ -104,6 +104,50 @@ def _disable_numbering(paragraph: etree._Element) -> None:
     numid.set(W_VAL, "0")
 
 
+def _edit_distance(left: str, right: str) -> int:
+    source = left.lower()
+    target = right.lower()
+    costs = list(range(len(target) + 1))
+
+    for source_index, source_char in enumerate(source, start=1):
+        previous_diagonal = source_index - 1
+        costs[0] = source_index
+        for target_index, target_char in enumerate(target, start=1):
+            insertion_cost = costs[target_index] + 1
+            deletion_cost = costs[target_index - 1] + 1
+            substitution_cost = previous_diagonal + (source_char != target_char)
+            previous_diagonal = costs[target_index]
+            costs[target_index] = min(insertion_cost, deletion_cost, substitution_cost)
+
+    return costs[-1]
+
+
+def _similarity(left: str, right: str) -> float:
+    longer = left if len(left) >= len(right) else right
+    shorter = right if longer is left else left
+    if not longer:
+        return 1.0
+    return (len(longer) - _edit_distance(longer, shorter)) / len(longer)
+
+
+def _find_best_paragraph(root: etree._Element, query: str, threshold: float) -> etree._Element | None:
+    best_match = None
+    best_similarity = 0.0
+
+    for paragraph in root.iter(W_P):
+        paragraph_text = _paragraph_text(paragraph).strip()
+        if not paragraph_text:
+            continue
+        similarity = _similarity(paragraph_text, query.strip())
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_match = paragraph
+
+    if best_similarity >= threshold:
+        return best_match
+    return None
+
+
 def _replace_ooxml_paragraph(paragraph: etree._Element, original: str, modified: str) -> bool:
     paragraph_text = _paragraph_text(paragraph)
     if original not in paragraph_text:
@@ -128,8 +172,18 @@ def _insert_after_ooxml_paragraph(root: etree._Element, anchor: str, modified: s
         parent.insert(parent.index(paragraph) + 1, clone)
         return True
 
-    return False
+    best_match = _find_best_paragraph(root, anchor, threshold=0.72)
+    if best_match is None:
+        return False
 
+    clone = deepcopy(best_match)
+    _set_paragraph_text(clone, modified)
+    _disable_numbering(clone)
+    parent = best_match.getparent()
+    if parent is None:
+        return False
+    parent.insert(parent.index(best_match) + 1, clone)
+    return True
 
 def _append_ooxml_paragraph(root: etree._Element, modified: str) -> bool:
     body = root.find(f".//{{{W_NS}}}body")

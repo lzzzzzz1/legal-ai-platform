@@ -91,6 +91,38 @@ def test_export_inserts_missing_clause_after_anchor() -> None:
     assert paragraphs[1].style.name == paragraphs[0].style.name
 
 
+def test_export_fuzzy_matches_insertion_anchor() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [
+                    {
+                        "original": "【缺失该约定】",
+                        "modified": "新增通知条款：双方应明确联系人与送达邮箱。",
+                        "insert_after_text": "合同份数一式两份",
+                    }
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+
+    reviewed_document = Document(BytesIO(response.content))
+    paragraphs = reviewed_document.paragraphs
+
+    assert paragraphs[1].text == "新增通知条款：双方应明确联系人与送达邮箱。"
+
+
 def test_export_appends_missing_clause_modification() -> None:
     response = client.post(
         "/api/export",

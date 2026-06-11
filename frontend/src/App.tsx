@@ -107,6 +107,90 @@ function textToEditorHtml(text: string) {
   return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("");
 }
 
+function editDistance(s1: string, s2: string): number {
+  const left = s1.toLowerCase();
+  const right = s2.toLowerCase();
+  const costs: number[] = [];
+
+  for (let i = 0; i <= left.length; i += 1) {
+    let lastValue = i;
+    for (let j = 0; j <= right.length; j += 1) {
+      if (i === 0) {
+        costs[j] = j;
+      } else if (j > 0) {
+        let newValue = costs[j - 1];
+        if (left.charAt(i - 1) !== right.charAt(j - 1)) {
+          newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+        }
+        costs[j - 1] = lastValue;
+        lastValue = newValue;
+      }
+    }
+    if (i > 0) {
+      costs[right.length] = lastValue;
+    }
+  }
+
+  return costs[right.length];
+}
+
+function getSimilarity(s1: string, s2: string): number {
+  let longer = s1;
+  let shorter = s2;
+  if (s1.length < s2.length) {
+    longer = s2;
+    shorter = s1;
+  }
+
+  const longerLength = longer.length;
+  if (longerLength === 0) {
+    return 1;
+  }
+
+  return (longerLength - editDistance(longer, shorter)) / longerLength;
+}
+
+function findFuzzyMatch(fullText: string, query: string, threshold = 0.8) {
+  if (!query) {
+    return null;
+  }
+
+  const exactIdx = fullText.indexOf(query);
+  if (exactIdx >= 0) {
+    return { from: exactIdx, to: exactIdx + query.length, matchedText: query, similarity: 1 };
+  }
+
+  const paragraphs = fullText.split("\n");
+  let bestSim = 0;
+  let bestParagraph = "";
+  let currentOffset = 0;
+  let bestOffset = -1;
+
+  for (const paragraph of paragraphs) {
+    const trimmed = paragraph.trim();
+    if (trimmed.length > 0) {
+      const sim = getSimilarity(trimmed, query);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestParagraph = paragraph;
+        bestOffset = currentOffset;
+      }
+    }
+    currentOffset += paragraph.length + 1;
+  }
+
+  if (bestSim >= threshold && bestOffset >= 0) {
+    return {
+      from: bestOffset,
+      to: bestOffset + bestParagraph.length,
+      matchedText: bestParagraph,
+      similarity: bestSim
+    };
+  }
+
+  return null;
+}
+
 function normalizeParagraphs(text: string): ParagraphOption[] {
   return text
     .split(/\r?\n/)
@@ -314,8 +398,8 @@ export default function App() {
 
     const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
     const anchor = anchorText ?? "";
-    const anchorIndex = anchor ? currentText.indexOf(anchor) : -1;
-    const insertionIndex = anchorIndex >= 0 ? anchorIndex + anchor.length : currentText.length;
+    const fuzzyAnchorMatch = anchor ? findFuzzyMatch(currentText, anchor, 0.72) : null;
+    const insertionIndex = fuzzyAnchorMatch ? fuzzyAnchorMatch.to : currentText.length;
     const nextText =
       currentText.slice(0, insertionIndex) +
       "\n\n" +
@@ -327,7 +411,7 @@ export default function App() {
     setError(null);
     setManualInsertRiskKey(null);
     setManualInsertAfterText("");
-    setEditorNotice(anchorIndex >= 0 ? `已在指定段落后追加"${risk.item}"的补充条款。` : `已追加"${risk.item}"的补充条款到合同末尾。`);
+    setEditorNotice(fuzzyAnchorMatch ? `已在指定段落后追加"${risk.item}"的补充条款。` : `已追加"${risk.item}"的补充条款到合同末尾。`);
     setModifications((previous) => [
       ...previous.filter((item) => item.modified !== risk.suggestion),
       {
@@ -355,12 +439,12 @@ export default function App() {
       return;
     }
 
-    const index = currentText.indexOf(candidate);
-    if (index < 0) {
+    const match = findFuzzyMatch(currentText, candidate, isMissingClause(risk.original_text) ? 0.72 : 0.82);
+    if (!match) {
       return;
     }
 
-    revealEditorSelection(index + 1, index + candidate.length + 1);
+    revealEditorSelection(match.from + 1, match.to + 1);
   }
 
   function applySuggestion(risk: ReviewRisk, riskKey: string) {
@@ -374,10 +458,10 @@ export default function App() {
 
     if (missing) {
       const anchor = risk.insert_after_text ?? risk.anchor_text ?? "";
-      const anchorIndex = anchor ? currentText.indexOf(anchor) : -1;
+      const anchorMatch = anchor ? findFuzzyMatch(currentText, anchor, 0.72) : null;
 
-      if (anchorIndex >= 0) {
-        applyMissingSuggestion(risk, anchor);
+      if (anchorMatch) {
+        applyMissingSuggestion(risk, anchorMatch.matchedText);
         return;
       }
 
@@ -388,14 +472,16 @@ export default function App() {
       return;
     }
 
-    const originalIndex = currentText.indexOf(risk.original_text);
-
-    if (originalIndex === -1) {
+    const originalMatch = findFuzzyMatch(currentText, risk.original_text, 0.84);
+    if (!originalMatch) {
       setError("未在当前合同正文中找到对应原文，可能已被修改或模型返回的原文不完全一致。");
       return;
     }
 
-    const nextText = currentText.replace(risk.original_text, risk.suggestion);
+    const nextText =
+      currentText.slice(0, originalMatch.from) +
+      risk.suggestion +
+      currentText.slice(originalMatch.to);
     editor.commands.setContent(textToEditorHtml(nextText));
     setEditorText(nextText);
     setError(null);
@@ -410,7 +496,10 @@ export default function App() {
       }
     ]);
 
-    revealEditorSelection(Math.max(1, originalIndex + 1), Math.max(1, originalIndex + risk.suggestion.length + 1));
+    revealEditorSelection(
+      Math.max(1, originalMatch.from + 1),
+      Math.max(1, originalMatch.from + risk.suggestion.length + 1)
+    );
   }
 
   async function handleExport() {
