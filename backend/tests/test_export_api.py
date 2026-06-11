@@ -56,6 +56,57 @@ def test_export_returns_modified_docx() -> None:
     assert "签订地点：上海市浦东新区。" in table_text
 
 
+def test_export_can_use_final_editor_text() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": "[]",
+            "final_text": "合同份数：一式六份，双方各执三份。\n新增税务条款：税费由乙方承担。",
+        },
+    )
+
+    assert response.status_code == 200
+
+    reviewed_document = Document(BytesIO(response.content))
+    paragraphs_text = "\n".join(paragraph.text for paragraph in reviewed_document.paragraphs)
+
+    assert "合同份数：一式六份，双方各执三份。" in paragraphs_text
+    assert "新增税务条款：税费由乙方承担。" in paragraphs_text
+
+
+def test_export_appends_missing_clause_modification() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{"original": "【缺失该约定】", "modified": "新增条款：双方应明确通知联系人。"}],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+
+    reviewed_document = Document(BytesIO(response.content))
+    paragraphs_text = "\n".join(paragraph.text for paragraph in reviewed_document.paragraphs)
+
+    assert "新增条款：双方应明确通知联系人。" in paragraphs_text
+
+
 def test_export_rejects_invalid_modifications_json() -> None:
     response = client.post(
         "/api/export",

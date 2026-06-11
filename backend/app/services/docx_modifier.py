@@ -66,6 +66,55 @@ def _iter_table_paragraphs(document: Document):
                             yield from nested_cell.paragraphs
 
 
+MISSING_SENTINEL = "\u3010\u7f3a\u5931\u8be5\u7ea6\u5b9a\u3011"
+
+
+def _is_missing_sentinel(text: str) -> bool:
+    return text.strip() in (MISSING_SENTINEL, "\u7f3a\u5931\u8be5\u7ea6\u5b9a")
+
+
+def _clear_paragraph(paragraph: Paragraph) -> None:
+    if paragraph.runs:
+        paragraph.runs[0].text = ""
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run("")
+
+
+def replace_docx_body_text(file_bytes: bytes, final_text: str) -> bytes:
+    document = Document(BytesIO(file_bytes))
+    lines = [line.strip() for line in final_text.splitlines() if line.strip()]
+
+    if not lines:
+        raise ValueError("final_text must include readable text")
+
+    if not document.paragraphs:
+        document.add_paragraph("")
+
+    target_index = 0
+
+    for line in lines:
+        if target_index < len(document.paragraphs):
+            paragraph = document.paragraphs[target_index]
+            if paragraph.runs:
+                paragraph.runs[0].text = line
+                for run in paragraph.runs[1:]:
+                    run.text = ""
+            else:
+                paragraph.add_run(line)
+        else:
+            document.add_paragraph(line)
+        target_index += 1
+
+    for paragraph in document.paragraphs[target_index:]:
+        _clear_paragraph(paragraph)
+
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def modify_docx_inplace(file_bytes: bytes, modifications: list[Modification]) -> bytes:
     document = Document(BytesIO(file_bytes))
     normalized_modifications = [_modification_texts(item) for item in modifications]
@@ -74,8 +123,12 @@ def modify_docx_inplace(file_bytes: bytes, modifications: list[Modification]) ->
     paragraphs.extend(_iter_table_paragraphs(document))
 
     for original, modified in normalized_modifications:
-        for paragraph in paragraphs:
-            _replace_in_paragraph(paragraph, original, modified)
+        if _is_missing_sentinel(original):
+            # Append as new paragraph at end of document
+            document.add_paragraph(modified)
+        else:
+            for paragraph in paragraphs:
+                _replace_in_paragraph(paragraph, original, modified)
 
     buffer = BytesIO()
     document.save(buffer)

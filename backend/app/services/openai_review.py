@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 
 from dotenv import load_dotenv
@@ -19,8 +19,11 @@ SYSTEM_PROMPT = (
     "你是一名资深合同审查律师。请分析合同条款，逐项检查："
     "合同份数、签订地点、联系人信息、税务条款。"
     "你必须结合提供的参考法条提出修改建议，并在 suggestion 中写明引用的法律法规名称及条文号。"
-    "每个风险项必须包含 original_text，值必须是合同原文中可精确定位的完整原句或短语。"
-    "original_text 不得改写、增删标点符号、空格或换行，不得翻译，不得概括。"
+    "每个风险项必须包含 original_text 字段："
+    "  - 如果该条款在合同中存在对应文字，original_text 必须是合同原文中可精确定位的完整原句或短语，"
+    "    不得改写、增删标点符号、空格或换行，不得翻译，不得概括。"
+    "  - 如果该条款在合同中完全缺失（即合同根本没有提及该内容），"
+    "    original_text 必须设为固定值：【缺失该约定】"
     "只输出 JSON，不要输出 Markdown。"
 )
 
@@ -60,6 +63,9 @@ def _normalize_review_payload(payload: object) -> dict:
 def parse_review_response(content: str, filename: str) -> ReviewResponse:
     payload = json.loads(content)
     normalized_payload = _normalize_review_payload(payload)
+    # Remove contract_text from AI payload to prevent overriding
+    # the backend-set value (which comes from the actual docx extraction).
+    normalized_payload.pop("contract_text", None)
     return ReviewResponse(filename=filename, **normalized_payload)
 
 

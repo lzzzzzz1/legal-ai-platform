@@ -667,6 +667,18 @@ h2 {
   color: #4f5f55;
 }
 
+.original-missing {
+  border-color: rgb(161 92 7 / 28%);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-style: italic;
+}
+
+.quote-append {
+  border-color: rgb(161 92 7 / 28%);
+  color: var(--warn);
+}
+
 .risk-title {
   margin-bottom: 6px;
   color: inherit;

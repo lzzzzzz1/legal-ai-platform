@@ -40,9 +40,20 @@ const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
 const reviewScopes = ["合同份数", "签订地点", "联系人信息", "税务条款"];
 const emptyEditorHtml = "<p>上传并审查合同后，解析出的正文会显示在这里。</p>";
+const MISSING_SENTINEL = "【缺失该约定】";
+
+function isMissingClause(originalText: string | undefined | null): boolean {
+  if (!originalText) return true;
+  const trimmed = originalText.trim();
+  return trimmed === "" || trimmed === MISSING_SENTINEL || trimmed === "缺失该约定";
+}
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
+    if (error.message === "Not Found") {
+      return "导出接口暂未在运行中的后端生效，请重启或重建后端服务后再试。";
+    }
+
     if (error.message.includes("DASHSCOPE_API_KEY")) {
       return "百炼 API Key 未配置或未进入容器，请检查 backend/.env 后重启后端服务。";
     }
@@ -87,6 +98,10 @@ function textToEditorHtml(text: string) {
   return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("");
 }
 
+function normalizeDraftText(text: string) {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
 async function reviewContract(file: File): Promise<ReviewResponse> {
   const formData = new FormData();
   formData.append("file", file);
@@ -104,10 +119,11 @@ async function reviewContract(file: File): Promise<ReviewResponse> {
   return response.json();
 }
 
-async function exportReviewedContract(file: File, modifications: Modification[]) {
+async function exportReviewedContract(file: File, modifications: Modification[], finalText: string) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("modifications", JSON.stringify(modifications));
+  formData.append("final_text", finalText);
 
   const response = await fetch("/api/export", {
     method: "POST",
@@ -139,6 +155,7 @@ export default function App() {
   const [review, setReview] = useState<ReviewResponse | null>(null);
   const [modifications, setModifications] = useState<Modification[]>([]);
   const [editorText, setEditorText] = useState("");
+  const [originalEditorText, setOriginalEditorText] = useState("");
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -166,11 +183,13 @@ export default function App() {
     if (review?.contract_text) {
       editor.commands.setContent(textToEditorHtml(review.contract_text));
       setEditorText(review.contract_text);
+      setOriginalEditorText(review.contract_text);
       return;
     }
 
     editor.commands.setContent(emptyEditorHtml);
     setEditorText("");
+    setOriginalEditorText("");
   }, [editor, review?.contract_text]);
 
   const sortedRisks = useMemo(() => {
@@ -187,13 +206,15 @@ export default function App() {
   }, [sortedRisks]);
 
   const canSubmit = useMemo(() => Boolean(file) && !isLoading, [file, isLoading]);
-  const canExport = Boolean(file) && modifications.length > 0 && !isExporting;
+  const editorHasChanges = normalizeDraftText(editorText) !== normalizeDraftText(originalEditorText);
+  const canExport = Boolean(file) && Boolean(review) && Boolean(normalizeDraftText(editorText)) && editorHasChanges && !isExporting;
   const totalRisks = sortedRisks.length;
 
   function resetEditorState() {
     setModifications([]);
     setEditorNotice(null);
     setEditorText("");
+    setOriginalEditorText("");
     editor?.commands.setContent(emptyEditorHtml);
   }
 
@@ -262,12 +283,28 @@ export default function App() {
       return;
     }
 
-    if (!risk.original_text) {
-      setError("该风险项缺少合同原文定位，无法引用修改。");
+    const missing = isMissingClause(risk.original_text);
+    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
+
+    if (missing) {
+      const appendText = "\n\n" + risk.suggestion;
+      const nextText = currentText + appendText;
+      editor.commands.setContent(textToEditorHtml(nextText));
+      setEditorText(nextText);
+      setError(null);
+      setEditorNotice(`已追加"${risk.item}"的补充条款到合同末尾。`);
+      setModifications((previous) => [
+        ...previous,
+        { original: MISSING_SENTINEL, modified: risk.suggestion }
+      ]);
+
+      requestAnimationFrame(() => {
+        editor.commands.focus();
+        editor.commands.setTextSelection(editor.state.doc.content.size);
+      });
       return;
     }
 
-    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
     const originalIndex = currentText.indexOf(risk.original_text);
 
     if (originalIndex === -1) {
@@ -300,8 +337,9 @@ export default function App() {
       return;
     }
 
-    if (!modifications.length) {
-      setError("请先在风险卡片中引用至少一条修改建议。");
+    const finalText = editor?.getText({ blockSeparator: "\n" }) ?? editorText;
+    if (!normalizeDraftText(finalText)) {
+      setError("合同正文为空，无法导出修改版。");
       return;
     }
 
@@ -309,7 +347,7 @@ export default function App() {
     setError(null);
 
     try {
-      const blob = await exportReviewedContract(file, modifications);
+      const blob = await exportReviewedContract(file, modifications, finalText);
       downloadBlob(blob, "reviewed_contract.docx");
       setEditorNotice("修改版合同已生成并开始下载。");
     } catch (exportError) {
@@ -468,14 +506,14 @@ export default function App() {
                           <span>{levelLabel[risk.level]}</span>
                           <h3>{risk.item}</h3>
                         </div>
-                        <button className="quote-button" type="button" onClick={() => applySuggestion(risk)}>
-                          引用修改
+                        <button className={`quote-button${isMissingClause(risk.original_text) ? " quote-append" : ""}`} type="button" onClick={() => applySuggestion(risk)}>
+                          {isMissingClause(risk.original_text) ? "追加条款" : "引用修改"}
                         </button>
                       </div>
 
-                      <div className="original-block">
+                      <div className={`original-block${isMissingClause(risk.original_text) ? " original-missing" : ""}`}>
                         <p className="risk-title">定位原文</p>
-                        <p>{risk.original_text}</p>
+                        <p>{isMissingClause(risk.original_text) ? "\u26A0\uFE0F 合同中缺失该约定，建议补充" : risk.original_text}</p>
                       </div>
 
                       <div className="risk-columns">
@@ -484,7 +522,7 @@ export default function App() {
                           <p>{risk.risk}</p>
                         </div>
                         <div className="suggestion-block">
-                          <p className="risk-title">修改建议</p>
+                          <p className="risk-title">{isMissingClause(risk.original_text) ? "建议补充条款" : "修改建议"}</p>
                           <p>{risk.suggestion}</p>
                         </div>
                       </div>
