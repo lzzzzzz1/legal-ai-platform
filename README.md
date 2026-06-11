@@ -48,3 +48,18 @@ docker compose up --build
 Open `http://localhost:5173`. The frontend container serves the built React app
 with Nginx and proxies API traffic to the backend container.
 
+## Law Ingestion
+
+Start local Qdrant:
+
+```powershell
+docker compose up -d qdrant
+```
+
+Ingest the sample Civil Code contract articles:
+
+```powershell
+cd backend
+python scripts/ingest_laws.py --source-file tests/data/civil_code_sample.txt
+```
+

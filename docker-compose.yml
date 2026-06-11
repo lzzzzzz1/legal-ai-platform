@@ -1,11 +1,15 @@
-﻿services:
+services:
   backend:
     build:
       context: ./backend
     env_file:
       - ./backend/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
     ports:
       - "8000:8000"
+    depends_on:
+      - qdrant
 
   frontend:
     build:
@@ -15,3 +19,12 @@
     ports:
       - "5173:80"
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
