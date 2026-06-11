@@ -1,12 +1,22 @@
 import json
 from io import BytesIO
+from copy import deepcopy
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
 
-from docx import Document
-from docx.text.paragraph import Paragraph
+from lxml import etree
 
 
 Modification = dict[str, Any]
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+W_P = f"{{{W_NS}}}p"
+W_R = f"{{{W_NS}}}r"
+W_T = f"{{{W_NS}}}t"
+W_PPR = f"{{{W_NS}}}pPr"
+W_NUMPR = f"{{{W_NS}}}numPr"
+W_NUMID = f"{{{W_NS}}}numId"
+W_VAL = f"{{{W_NS}}}val"
+XML_STORY_PREFIXES = ("word/document.xml", "word/header", "word/footer")
 
 
 def parse_modifications(modifications_json: str) -> list[Modification]:
@@ -39,31 +49,13 @@ def _modification_texts(modification: Modification) -> tuple[str, str]:
     return original, modified
 
 
-def _replace_in_paragraph(paragraph: Paragraph, original: str, modified: str) -> bool:
-    paragraph_text = paragraph.text
-    if original not in paragraph_text:
-        return False
-
-    replaced_text = paragraph_text.replace(original, modified)
-    if paragraph.runs:
-        paragraph.runs[0].text = replaced_text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-    else:
-        paragraph.add_run(replaced_text)
-
-    return True
-
-
-def _iter_table_paragraphs(document: Document):
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                yield from cell.paragraphs
-                for nested_table in cell.tables:
-                    for nested_row in nested_table.rows:
-                        for nested_cell in nested_row.cells:
-                            yield from nested_cell.paragraphs
+def _modification_anchor(modification: Modification) -> str | None:
+    anchor = modification.get("insert_after_text")
+    if anchor is None:
+        anchor = modification.get("anchor_text")
+    if not isinstance(anchor, str) or not anchor.strip():
+        return None
+    return anchor
 
 
 MISSING_SENTINEL = "\u3010\u7f3a\u5931\u8be5\u7ea6\u5b9a\u3011"
@@ -73,63 +65,134 @@ def _is_missing_sentinel(text: str) -> bool:
     return text.strip() in (MISSING_SENTINEL, "\u7f3a\u5931\u8be5\u7ea6\u5b9a")
 
 
-def _clear_paragraph(paragraph: Paragraph) -> None:
-    if paragraph.runs:
-        paragraph.runs[0].text = ""
-        for run in paragraph.runs[1:]:
-            run.text = ""
+def _is_story_xml(path: str) -> bool:
+    return path == "word/document.xml" or (
+        path.endswith(".xml") and any(path.startswith(prefix) for prefix in XML_STORY_PREFIXES[1:])
+    )
+
+
+def _paragraph_text(paragraph: etree._Element) -> str:
+    return "".join(text_node.text or "" for text_node in paragraph.iter(W_T))
+
+
+def _set_paragraph_text(paragraph: etree._Element, text: str) -> None:
+    text_nodes = list(paragraph.iter(W_T))
+    if text_nodes:
+        text_nodes[0].text = text
+        for node in text_nodes[1:]:
+            node.text = ""
+        return
+
+    run = etree.SubElement(paragraph, W_R)
+    text_node = etree.SubElement(run, W_T)
+    text_node.text = text
+
+
+def _disable_numbering(paragraph: etree._Element) -> None:
+    ppr = paragraph.find(W_PPR)
+    if ppr is None:
+        ppr = etree.Element(W_PPR)
+        paragraph.insert(0, ppr)
+
+    numpr = ppr.find(W_NUMPR)
+    if numpr is None:
+        numpr = etree.SubElement(ppr, W_NUMPR)
+
+    numid = numpr.find(W_NUMID)
+    if numid is None:
+        numid = etree.SubElement(numpr, W_NUMID)
+    numid.set(W_VAL, "0")
+
+
+def _replace_ooxml_paragraph(paragraph: etree._Element, original: str, modified: str) -> bool:
+    paragraph_text = _paragraph_text(paragraph)
+    if original not in paragraph_text:
+        return False
+
+    _set_paragraph_text(paragraph, paragraph_text.replace(original, modified))
+    return True
+
+
+def _insert_after_ooxml_paragraph(root: etree._Element, anchor: str, modified: str) -> bool:
+    for paragraph in root.iter(W_P):
+        paragraph_text = _paragraph_text(paragraph)
+        if anchor not in paragraph_text:
+            continue
+
+        clone = deepcopy(paragraph)
+        _set_paragraph_text(clone, modified)
+        _disable_numbering(clone)
+        parent = paragraph.getparent()
+        if parent is None:
+            return False
+        parent.insert(parent.index(paragraph) + 1, clone)
+        return True
+
+    return False
+
+
+def _append_ooxml_paragraph(root: etree._Element, modified: str) -> bool:
+    body = root.find(f".//{{{W_NS}}}body")
+    if body is None:
+        return False
+
+    paragraphs = list(body.iter(W_P))
+    if paragraphs:
+        clone = deepcopy(paragraphs[-1])
+        _set_paragraph_text(clone, modified)
+        _disable_numbering(clone)
     else:
-        paragraph.add_run("")
+        clone = etree.Element(W_P)
+        _set_paragraph_text(clone, modified)
+
+    sect_pr = body.find(f"{{{W_NS}}}sectPr")
+    if sect_pr is None:
+        body.append(clone)
+    else:
+        body.insert(body.index(sect_pr), clone)
+    return True
 
 
-def replace_docx_body_text(file_bytes: bytes, final_text: str) -> bytes:
-    document = Document(BytesIO(file_bytes))
-    lines = [line.strip() for line in final_text.splitlines() if line.strip()]
+def _modify_xml_story(xml_bytes: bytes, modifications: list[tuple[str, str, str | None]]) -> tuple[bytes, int]:
+    parser = etree.XMLParser(remove_blank_text=False, recover=True)
+    root = etree.fromstring(xml_bytes, parser=parser)
+    applied = 0
 
-    if not lines:
-        raise ValueError("final_text must include readable text")
+    for original, modified, anchor in modifications:
+        if _is_missing_sentinel(original):
+            inserted = False
+            if anchor:
+                inserted = _insert_after_ooxml_paragraph(root, anchor, modified)
+            if not inserted:
+                inserted = _append_ooxml_paragraph(root, modified)
+            applied += int(inserted)
+            continue
 
-    if not document.paragraphs:
-        document.add_paragraph("")
+        matched = False
+        for paragraph in root.iter(W_P):
+            matched = _replace_ooxml_paragraph(paragraph, original, modified) or matched
+        applied += int(matched)
 
-    target_index = 0
-
-    for line in lines:
-        if target_index < len(document.paragraphs):
-            paragraph = document.paragraphs[target_index]
-            if paragraph.runs:
-                paragraph.runs[0].text = line
-                for run in paragraph.runs[1:]:
-                    run.text = ""
-            else:
-                paragraph.add_run(line)
-        else:
-            document.add_paragraph(line)
-        target_index += 1
-
-    for paragraph in document.paragraphs[target_index:]:
-        _clear_paragraph(paragraph)
-
-    buffer = BytesIO()
-    document.save(buffer)
-    return buffer.getvalue()
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), applied
 
 
 def modify_docx_inplace(file_bytes: bytes, modifications: list[Modification]) -> bytes:
-    document = Document(BytesIO(file_bytes))
-    normalized_modifications = [_modification_texts(item) for item in modifications]
+    normalized_modifications = [
+        (*_modification_texts(item), _modification_anchor(item)) for item in modifications
+    ]
 
-    paragraphs = list(document.paragraphs)
-    paragraphs.extend(_iter_table_paragraphs(document))
+    output = BytesIO()
+    total_applied = 0
+    with ZipFile(BytesIO(file_bytes), "r") as source_docx:
+        with ZipFile(output, "w", ZIP_DEFLATED) as target_docx:
+            for item in source_docx.infolist():
+                data = source_docx.read(item.filename)
+                if _is_story_xml(item.filename):
+                    data, applied = _modify_xml_story(data, normalized_modifications)
+                    total_applied += applied
+                target_docx.writestr(item, data)
 
-    for original, modified in normalized_modifications:
-        if _is_missing_sentinel(original):
-            # Append as new paragraph at end of document
-            document.add_paragraph(modified)
-        else:
-            for paragraph in paragraphs:
-                _replace_in_paragraph(paragraph, original, modified)
+    if normalized_modifications and total_applied == 0:
+        raise ValueError("No matching text or insertion anchor was found in the document.")
 
-    buffer = BytesIO()
-    document.save(buffer)
-    return buffer.getvalue()
+    return output.getvalue()

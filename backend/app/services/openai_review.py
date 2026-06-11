@@ -23,7 +23,9 @@ SYSTEM_PROMPT = (
     "  - 如果该条款在合同中存在对应文字，original_text 必须是合同原文中可精确定位的完整原句或短语，"
     "    不得改写、增删标点符号、空格或换行，不得翻译，不得概括。"
     "  - 如果该条款在合同中完全缺失（即合同根本没有提及该内容），"
-    "    original_text 必须设为固定值：【缺失该约定】"
+    "    original_text 必须设为固定值：【缺失该约定】，并尽量提供 insert_after_text。"
+    "insert_after_text 必须是合同中真实存在的完整原句或标题，用于定位新增条款插入位置；"
+    "如果无法判断插入位置，可返回 null。"
     "只输出 JSON，不要输出 Markdown。"
 )
 
@@ -128,10 +130,13 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
                     "content": (
                         "请以 JSON 格式输出，格式必须是："
                         '{"risks":[{"item":"检查项","level":"high|medium|low",'
-                        '"original_text":"合同原文中的精确原句","risk":"风险提示","suggestion":"修改建议",'
+                        '"original_text":"合同原文中的精确原句或【缺失该约定】",'
+                        '"insert_after_text":"新增条款应插入其后的合同原文锚点或null",'
+                        '"risk":"风险提示","suggestion":"修改建议",'
                         '"laws":["《法规名称》第XXX条"]}]}。'
                         "level 只能使用 high、medium、low。"
                         "original_text 必须逐字复制合同文本中的对应内容，标点、空格和换行必须保持一致。"
+                        "若 original_text 为【缺失该约定】，insert_after_text 必须优先选择合同中相关章节标题或相邻条款原文。"
                         "laws 必须列出本条建议引用的法规名称及条文号。\n\n"
                         f"参考法条：\n{law_context}\n\n"
                         f"合同文本：\n{_trim_contract_text(contract_text)}"

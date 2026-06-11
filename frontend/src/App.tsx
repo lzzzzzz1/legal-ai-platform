@@ -8,6 +8,8 @@ type ReviewRisk = {
   item: string;
   level: RiskLevel;
   original_text: string;
+  anchor_text?: string | null;
+  insert_after_text?: string | null;
   risk: string;
   suggestion: string;
   laws?: string[];
@@ -22,6 +24,8 @@ type ReviewResponse = {
 type Modification = {
   original: string;
   modified: string;
+  anchor_text?: string | null;
+  insert_after_text?: string | null;
 };
 
 const levelLabel: Record<RiskLevel, string> = {
@@ -98,10 +102,6 @@ function textToEditorHtml(text: string) {
   return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("");
 }
 
-function normalizeDraftText(text: string) {
-  return text.replace(/\r\n/g, "\n").trim();
-}
-
 async function reviewContract(file: File): Promise<ReviewResponse> {
   const formData = new FormData();
   formData.append("file", file);
@@ -119,11 +119,10 @@ async function reviewContract(file: File): Promise<ReviewResponse> {
   return response.json();
 }
 
-async function exportReviewedContract(file: File, modifications: Modification[], finalText: string) {
+async function exportReviewedContract(file: File, modifications: Modification[]) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("modifications", JSON.stringify(modifications));
-  formData.append("final_text", finalText);
 
   const response = await fetch("/api/export", {
     method: "POST",
@@ -155,7 +154,6 @@ export default function App() {
   const [review, setReview] = useState<ReviewResponse | null>(null);
   const [modifications, setModifications] = useState<Modification[]>([]);
   const [editorText, setEditorText] = useState("");
-  const [originalEditorText, setOriginalEditorText] = useState("");
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -183,13 +181,11 @@ export default function App() {
     if (review?.contract_text) {
       editor.commands.setContent(textToEditorHtml(review.contract_text));
       setEditorText(review.contract_text);
-      setOriginalEditorText(review.contract_text);
       return;
     }
 
     editor.commands.setContent(emptyEditorHtml);
     setEditorText("");
-    setOriginalEditorText("");
   }, [editor, review?.contract_text]);
 
   const sortedRisks = useMemo(() => {
@@ -206,15 +202,13 @@ export default function App() {
   }, [sortedRisks]);
 
   const canSubmit = useMemo(() => Boolean(file) && !isLoading, [file, isLoading]);
-  const editorHasChanges = normalizeDraftText(editorText) !== normalizeDraftText(originalEditorText);
-  const canExport = Boolean(file) && Boolean(review) && Boolean(normalizeDraftText(editorText)) && editorHasChanges && !isExporting;
+  const canExport = Boolean(file) && Boolean(review) && modifications.length > 0 && !isExporting;
   const totalRisks = sortedRisks.length;
 
   function resetEditorState() {
     setModifications([]);
     setEditorNotice(null);
     setEditorText("");
-    setOriginalEditorText("");
     editor?.commands.setContent(emptyEditorHtml);
   }
 
@@ -287,20 +281,31 @@ export default function App() {
     const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
 
     if (missing) {
-      const appendText = "\n\n" + risk.suggestion;
-      const nextText = currentText + appendText;
+      const anchor = risk.insert_after_text ?? risk.anchor_text ?? "";
+      const anchorIndex = anchor ? currentText.indexOf(anchor) : -1;
+      const insertionIndex = anchorIndex >= 0 ? anchorIndex + anchor.length : currentText.length;
+      const nextText =
+        currentText.slice(0, insertionIndex) +
+        "\n\n" +
+        risk.suggestion +
+        currentText.slice(insertionIndex);
       editor.commands.setContent(textToEditorHtml(nextText));
       setEditorText(nextText);
       setError(null);
-      setEditorNotice(`已追加"${risk.item}"的补充条款到合同末尾。`);
+      setEditorNotice(anchorIndex >= 0 ? `已在锚点后追加"${risk.item}"的补充条款。` : `已追加"${risk.item}"的补充条款到合同末尾。`);
       setModifications((previous) => [
-        ...previous,
-        { original: MISSING_SENTINEL, modified: risk.suggestion }
+        ...previous.filter((item) => item.modified !== risk.suggestion),
+        {
+          original: MISSING_SENTINEL,
+          modified: risk.suggestion,
+          anchor_text: risk.anchor_text ?? null,
+          insert_after_text: risk.insert_after_text ?? risk.anchor_text ?? null
+        }
       ]);
 
       requestAnimationFrame(() => {
         editor.commands.focus();
-        editor.commands.setTextSelection(editor.state.doc.content.size);
+        editor.commands.setTextSelection(Math.max(1, insertionIndex + 1));
       });
       return;
     }
@@ -319,7 +324,12 @@ export default function App() {
     setEditorNotice(`已引用“${risk.item}”的修改建议。`);
     setModifications((previous) => [
       ...previous.filter((item) => item.original !== risk.original_text),
-      { original: risk.original_text, modified: risk.suggestion }
+      {
+        original: risk.original_text,
+        modified: risk.suggestion,
+        anchor_text: risk.anchor_text ?? null,
+        insert_after_text: risk.insert_after_text ?? null
+      }
     ]);
 
     requestAnimationFrame(() => {
@@ -337,9 +347,8 @@ export default function App() {
       return;
     }
 
-    const finalText = editor?.getText({ blockSeparator: "\n" }) ?? editorText;
-    if (!normalizeDraftText(finalText)) {
-      setError("合同正文为空，无法导出修改版。");
+    if (!modifications.length) {
+      setError("请先在右侧风险卡片中引用或追加至少一条修改。");
       return;
     }
 
@@ -347,7 +356,7 @@ export default function App() {
     setError(null);
 
     try {
-      const blob = await exportReviewedContract(file, modifications, finalText);
+      const blob = await exportReviewedContract(file, modifications);
       downloadBlob(blob, "reviewed_contract.docx");
       setEditorNotice("修改版合同已生成并开始下载。");
     } catch (exportError) {
@@ -433,7 +442,7 @@ export default function App() {
             <div className="export-row">
               <div>
                 <strong>{modifications.length}</strong>
-                <span>条已引用修改</span>
+                <span>条已接受修改</span>
               </div>
               <button className="primary-button" type="button" disabled={!canExport} onClick={handleExport}>
                 {isExporting ? "导出中" : "确认并导出修改版"}

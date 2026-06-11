@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.schemas.review import ReviewResponse
-from app.services.docx_modifier import modify_docx_inplace, parse_modifications, replace_docx_body_text
+from app.services.docx_modifier import modify_docx_inplace, parse_modifications
 from app.services.docx_parser import extract_docx_text
 from app.services.openai_review import review_contract_text
 
@@ -72,7 +72,6 @@ async def review_contract(file: UploadFile = File(...)) -> ReviewResponse:
 async def export_reviewed_contract(
     file: UploadFile = File(...),
     modifications: str = Form(...),
-    final_text: str | None = Form(default=None),
 ) -> StreamingResponse:
     if not file.filename or not file.filename.lower().endswith(".docx"):
         raise HTTPException(
@@ -94,11 +93,8 @@ async def export_reviewed_contract(
         )
 
     try:
-        if final_text and final_text.strip():
-            reviewed_docx = replace_docx_body_text(file_bytes, final_text)
-        else:
-            parsed_modifications = parse_modifications(modifications)
-            reviewed_docx = modify_docx_inplace(file_bytes, parsed_modifications)
+        parsed_modifications = parse_modifications(modifications)
+        reviewed_docx = modify_docx_inplace(file_bytes, parsed_modifications)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

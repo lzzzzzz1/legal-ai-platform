@@ -12,7 +12,8 @@ client = TestClient(app)
 
 def _build_docx_bytes() -> bytes:
     document = Document()
-    document.add_paragraph("合同份数：一式两份。")
+    styled_paragraph = document.add_paragraph("合同份数：一式两份。")
+    styled_paragraph.style = "List Paragraph"
     table = document.add_table(rows=1, cols=1)
     table.cell(0, 0).text = "签订地点：未约定。"
     buffer = BytesIO()
@@ -56,7 +57,7 @@ def test_export_returns_modified_docx() -> None:
     assert "签订地点：上海市浦东新区。" in table_text
 
 
-def test_export_can_use_final_editor_text() -> None:
+def test_export_inserts_missing_clause_after_anchor() -> None:
     response = client.post(
         "/api/export",
         files={
@@ -67,18 +68,27 @@ def test_export_can_use_final_editor_text() -> None:
             )
         },
         data={
-            "modifications": "[]",
-            "final_text": "合同份数：一式六份，双方各执三份。\n新增税务条款：税费由乙方承担。",
+            "modifications": json.dumps(
+                [
+                    {
+                        "original": "【缺失该约定】",
+                        "modified": "新增税务条款：税费由乙方承担。",
+                        "insert_after_text": "合同份数：一式两份。",
+                    }
+                ],
+                ensure_ascii=False,
+            )
         },
     )
 
     assert response.status_code == 200
 
     reviewed_document = Document(BytesIO(response.content))
-    paragraphs_text = "\n".join(paragraph.text for paragraph in reviewed_document.paragraphs)
+    paragraphs = reviewed_document.paragraphs
 
-    assert "合同份数：一式六份，双方各执三份。" in paragraphs_text
-    assert "新增税务条款：税费由乙方承担。" in paragraphs_text
+    assert paragraphs[0].text == "合同份数：一式两份。"
+    assert paragraphs[1].text == "新增税务条款：税费由乙方承担。"
+    assert paragraphs[1].style.name == paragraphs[0].style.name
 
 
 def test_export_appends_missing_clause_modification() -> None:
