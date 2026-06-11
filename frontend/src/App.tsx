@@ -1,4 +1,4 @@
-﻿import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
 
 type RiskLevel = "high" | "medium" | "low";
 
@@ -7,7 +7,7 @@ type ReviewRisk = {
   level: RiskLevel;
   risk: string;
   suggestion: string;
-  laws: string[];
+  laws?: string[];
 };
 
 type ReviewResponse = {
@@ -29,6 +29,7 @@ const levelOrder: Record<RiskLevel, number> = {
 
 const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
+const reviewScopes = ["合同份数", "签订地点", "联系人信息", "税务条款"];
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
@@ -92,6 +93,7 @@ export default function App() {
   }, [sortedRisks]);
 
   const canSubmit = useMemo(() => Boolean(file) && !isLoading, [file, isLoading]);
+  const totalRisks = sortedRisks.length;
 
   function clearReview() {
     setFile(null);
@@ -151,71 +153,118 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <section className="workspace">
-        <form className="upload-panel" onSubmit={handleSubmit}>
-          <p className="eyebrow">Legal AI Platform</p>
-          <h1>合同智能审查</h1>
-          <p className="intro">上传 .docx 合同，系统会检查关键条款并生成风险提示。</p>
+      <header className="topbar" aria-label="应用状态">
+        <div className="brand-block">
+          <span className="brand-mark" aria-hidden="true">
+            LA
+          </span>
+          <div>
+            <strong>Legal AI Platform</strong>
+            <span>合同审查工作台</span>
+          </div>
+        </div>
+        <div className="system-strip">
+          <span>Qdrant 法规库</span>
+          <span>qwen-max 审查</span>
+          <span>text-embedding-v3 检索</span>
+        </div>
+      </header>
 
-          <label className={`file-drop ${file ? "file-drop-active" : ""}`}>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              onChange={handleFileChange}
-            />
-            <span>{file ? "已选择合同" : "选择合同文件"}</span>
-            <strong>{file ? file.name : "仅支持 .docx，最大 10 MB"}</strong>
-            {file ? <small>{formatFileSize(file.size)}</small> : null}
-          </label>
-
-          <div className="button-row">
-            <button className="primary-button" type="submit" disabled={!canSubmit}>
-              {isLoading ? "审查中..." : review ? "重新审查" : "开始审查"}
-            </button>
-            {(file || review || error) && !isLoading ? (
-              <button className="secondary-button" type="button" onClick={clearReview}>
-                清空
-              </button>
-            ) : null}
+      <section className="workspace" aria-busy={isLoading}>
+        <aside className="control-panel">
+          <div className="panel-heading">
+            <span className="status-chip">RAG 已启用</span>
+            <h1>上传合同，获得带法条依据的风险审查。</h1>
+            <p>系统会抽取合同文本，检索法规库，并返回风险提示、修改建议和参考条文。</p>
           </div>
 
+          <form className="review-form" onSubmit={handleSubmit}>
+            <label className={`file-drop ${file ? "file-drop-active" : ""}`}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                onChange={handleFileChange}
+              />
+              <span className="file-kicker">{file ? "已载入合同" : "选择合同文件"}</span>
+              <strong>{file ? file.name : "拖入或选择 .docx 文件"}</strong>
+              <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，保留纯文本审查链路`}</small>
+            </label>
+
+            <div className="button-row">
+              <button className="primary-button" type="submit" disabled={!canSubmit}>
+                {isLoading ? "审查中" : review ? "重新审查" : "开始审查"}
+              </button>
+              {(file || review || error) && !isLoading ? (
+                <button className="secondary-button" type="button" onClick={clearReview}>
+                  清空
+                </button>
+              ) : null}
+            </div>
+          </form>
+
           {isLoading ? (
-            <div className="progress-card" role="status" aria-live="polite">
+            <div className="process-panel" role="status" aria-live="polite">
               <div className="progress-bar" />
-              <p>正在解析合同并调用百炼模型，请稍候。</p>
+              <p>正在解析合同、检索法规并调用百炼模型。</p>
             </div>
           ) : null}
 
           {error ? <p className="error-message">{error}</p> : null}
-        </form>
 
-        <div className="review-panel">
+          <div className="scope-panel" aria-label="审查范围">
+            <p>本次审查范围</p>
+            <div>
+              {reviewScopes.map((scope) => (
+                <span key={scope}>{scope}</span>
+              ))}
+            </div>
+          </div>
+        </aside>
+
+        <section className="result-panel">
+          <div className="result-header">
+            <div>
+              <span className="section-label">Review Result</span>
+              <h2>{review?.filename ?? "等待合同上传"}</h2>
+            </div>
+            <div className="score-summary" aria-label="风险统计">
+              <span className="score-high">高 {riskCounts.high}</span>
+              <span className="score-medium">中 {riskCounts.medium}</span>
+              <span className="score-low">低 {riskCounts.low}</span>
+            </div>
+          </div>
+
           {!review && !isLoading ? (
             <div className="empty-state">
-              <p>请选择一份合同开始审查。</p>
-              <span>结果会按风险等级自动排序。</span>
+              <span className="empty-code">READY</span>
+              <p>选择一份合同后，审查结果会在这里生成。</p>
+              <small>风险项会按严重程度排序，参考法条可展开查看。</small>
             </div>
           ) : null}
 
           {isLoading ? (
-            <div className="empty-state">
-              <p>正在分析合同关键条款...</p>
-              <span>通常需要 10 到 60 秒。</span>
+            <div className="loading-stack">
+              <div className="skeleton-line skeleton-title" />
+              <div className="skeleton-card" />
+              <div className="skeleton-card skeleton-card-short" />
             </div>
           ) : null}
 
           {review ? (
-            <section className="result-stack" aria-live="polite">
-              <div className="result-header">
+            <div className="result-stack" aria-live="polite">
+              <div className="summary-band">
                 <div>
-                  <p className="eyebrow">Review Result</p>
-                  <h2>{review.filename}</h2>
+                  <span>总风险</span>
+                  <strong>{totalRisks}</strong>
                 </div>
-                <div className="score-summary" aria-label="风险统计">
-                  <span className="score-high">高 {riskCounts.high}</span>
-                  <span className="score-medium">中 {riskCounts.medium}</span>
-                  <span className="score-low">低 {riskCounts.low}</span>
+                <div>
+                  <span>法规依据</span>
+                  <strong>{sortedRisks.reduce((count, risk) => count + (risk.laws?.length ?? 0), 0)}</strong>
+                </div>
+                <div>
+                  <span>审查状态</span>
+                  <strong>完成</strong>
                 </div>
               </div>
 
@@ -224,18 +273,24 @@ export default function App() {
                   sortedRisks.map((risk) => (
                     <article className={`risk-card risk-card-${risk.level}`} key={risk.item}>
                       <div className="risk-card-header">
-                        <h3>{risk.item}</h3>
-                        <span>{levelLabel[risk.level]}</span>
+                        <div>
+                          <span>{levelLabel[risk.level]}</span>
+                          <h3>{risk.item}</h3>
+                        </div>
                       </div>
-                      <div className="risk-block">
-                        <p className="risk-title">风险提示</p>
-                        <p>{risk.risk}</p>
+
+                      <div className="risk-columns">
+                        <div className="risk-block">
+                          <p className="risk-title">风险提示</p>
+                          <p>{risk.risk}</p>
+                        </div>
+                        <div className="suggestion-block">
+                          <p className="risk-title">修改建议</p>
+                          <p>{risk.suggestion}</p>
+                        </div>
                       </div>
-                      <div className="suggestion-block">
-                        <p className="risk-title">修改建议</p>
-                        <p>{risk.suggestion}</p>
-                      </div>
-                      {risk.laws.length ? (
+
+                      {risk.laws?.length ? (
                         <details className="law-reference">
                           <summary>参考法条依据</summary>
                           <ul>
@@ -254,9 +309,9 @@ export default function App() {
                   </div>
                 )}
               </div>
-            </section>
+            </div>
           ) : null}
-        </div>
+        </section>
       </section>
     </main>
   );
