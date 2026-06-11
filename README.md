@@ -45,8 +45,19 @@ Create `backend/.env` from `backend/.env.example` and fill `DASHSCOPE_API_KEY`, 
 docker compose up --build
 ```
 
-Open `http://localhost:5173`. The frontend container serves the built React app
+Open `http://localhost:8080`. The frontend container serves the built React app
 with Nginx and proxies API traffic to the backend container.
+
+When developing the frontend locally, keep `http://localhost:5173` reserved for
+Vite:
+
+```powershell
+cd frontend
+npm.cmd run dev
+```
+
+The Docker frontend container is exposed on `http://localhost:8080` to avoid
+showing an old container build when you expect the local Vite app.
 
 ## Law Ingestion
 
