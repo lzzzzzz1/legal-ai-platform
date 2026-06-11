@@ -57,6 +57,34 @@ def test_export_returns_modified_docx() -> None:
     assert "签订地点：上海市浦东新区。" in table_text
 
 
+def test_export_fuzzy_matches_replacement_text() -> None:
+    modifications = [
+        {
+            "original": "合同份数一式两份",
+            "modified": "合同份数：一式三份，甲乙双方各执一份，存档一份。",
+        }
+    ]
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={"modifications": json.dumps(modifications, ensure_ascii=False)},
+    )
+
+    assert response.status_code == 200
+
+    reviewed_document = Document(BytesIO(response.content))
+    paragraphs_text = "\n".join(paragraph.text for paragraph in reviewed_document.paragraphs)
+
+    assert "合同份数：一式三份，甲乙双方各执一份，存档一份。" in paragraphs_text
+
+
 def test_export_inserts_missing_clause_after_anchor() -> None:
     response = client.post(
         "/api/export",

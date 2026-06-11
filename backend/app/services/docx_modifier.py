@@ -157,6 +157,15 @@ def _replace_ooxml_paragraph(paragraph: etree._Element, original: str, modified:
     return True
 
 
+def _fuzzy_replace_ooxml_paragraph(root: etree._Element, original: str, modified: str) -> bool:
+    best_match = _find_best_paragraph(root, original, threshold=0.72)
+    if best_match is None:
+        return False
+
+    _set_paragraph_text(best_match, modified)
+    return True
+
+
 def _insert_after_ooxml_paragraph(root: etree._Element, anchor: str, modified: str) -> bool:
     for paragraph in root.iter(W_P):
         paragraph_text = _paragraph_text(paragraph)
@@ -225,6 +234,8 @@ def _modify_xml_story(xml_bytes: bytes, modifications: list[tuple[str, str, str 
         matched = False
         for paragraph in root.iter(W_P):
             matched = _replace_ooxml_paragraph(paragraph, original, modified) or matched
+        if not matched:
+            matched = _fuzzy_replace_ooxml_paragraph(root, original, modified)
         applied += int(matched)
 
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), applied
