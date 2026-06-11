@@ -43,6 +43,7 @@ def test_review_returns_structured_payload(monkeypatch) -> None:
                 {
                     "item": "合同份数",
                     "level": "low",
+                    "original_text": "合同份数：一式两份。",
                     "risk": "合同份数已约定，风险较低。",
                     "suggestion": "保留当前约定并核对盖章份数。",
                     "laws": ["《中华人民共和国民法典》第四百七十条"],

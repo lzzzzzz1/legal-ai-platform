@@ -19,6 +19,8 @@ SYSTEM_PROMPT = (
     "你是一名资深合同审查律师。请分析合同条款，逐项检查："
     "合同份数、签订地点、联系人信息、税务条款。"
     "你必须结合提供的参考法条提出修改建议，并在 suggestion 中写明引用的法律法规名称及条文号。"
+    "每个风险项必须包含 original_text，值必须是合同原文中可精确定位的完整原句或短语。"
+    "original_text 不得改写、增删标点符号、空格或换行，不得翻译，不得概括。"
     "只输出 JSON，不要输出 Markdown。"
 )
 
@@ -96,9 +98,10 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
                     "content": (
                         "请以 JSON 格式输出，格式必须是："
                         '{"risks":[{"item":"检查项","level":"high|medium|low",'
-                        '"risk":"风险提示","suggestion":"修改建议",'
+                        '"original_text":"合同原文中的精确原句","risk":"风险提示","suggestion":"修改建议",'
                         '"laws":["《法规名称》第XXX条"]}]}。'
                         "level 只能使用 high、medium、low。"
+                        "original_text 必须逐字复制合同文本中的对应内容，标点、空格和换行必须保持一致。"
                         "laws 必须列出本条建议引用的法规名称及条文号。\n\n"
                         f"参考法条：\n{law_context}\n\n"
                         f"合同文本：\n{_trim_contract_text(contract_text)}"
