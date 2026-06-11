@@ -63,7 +63,9 @@ async def review_contract(file: UploadFile = File(...)) -> ReviewResponse:
             detail="No readable text was found in the document.",
         )
 
-    return review_contract_text(contract_text=contract_text, filename=file.filename)
+    review = review_contract_text(contract_text=contract_text, filename=file.filename)
+    review.contract_text = contract_text
+    return review
 
 
 @app.post("/api/export")

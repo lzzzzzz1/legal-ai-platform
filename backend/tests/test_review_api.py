@@ -65,4 +65,5 @@ def test_review_returns_structured_payload(monkeypatch) -> None:
     )
 
     assert response.status_code == 200
+    assert "合同份数" in response.json()["contract_text"]
     assert response.json()["risks"][0]["item"] == "合同份数"

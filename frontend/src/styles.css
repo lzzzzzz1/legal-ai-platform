@@ -136,7 +136,7 @@ button:not(:disabled):active {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(310px, 420px) minmax(0, 1fr);
+  grid-template-columns: minmax(360px, 560px) minmax(0, 1fr);
   gap: 22px;
   max-width: 1320px;
   margin: 0 auto;
@@ -151,8 +151,6 @@ button:not(:disabled):active {
 }
 
 .control-panel {
-  position: sticky;
-  top: 22px;
   align-self: start;
   display: grid;
   gap: 20px;
@@ -287,6 +285,7 @@ h1 {
 
 .process-panel,
 .error-message,
+.success-message,
 .scope-panel {
   border-radius: var(--radius);
   padding: 14px;
@@ -326,6 +325,94 @@ h1 {
   background: var(--danger-soft);
   color: var(--danger);
   line-height: 1.5;
+}
+
+.success-message {
+  border: 1px solid rgb(20 92 61 / 18%);
+  background: var(--accent-soft);
+  color: var(--accent);
+  line-height: 1.5;
+}
+
+.editor-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.editor-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.editor-heading h2 {
+  font-size: 1.25rem;
+}
+
+.editor-heading > span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.editor-page {
+  min-height: 520px;
+  max-height: 720px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, #ffffff 0%, #ffffff 74%, #fbfcfb 100%);
+  padding: 30px;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 60%);
+}
+
+.contract-editor,
+.ProseMirror {
+  min-height: 460px;
+  outline: none;
+  color: var(--ink);
+  font-family: "Times New Roman", SimSun, serif;
+  font-size: 1rem;
+  line-height: 1.85;
+}
+
+.contract-editor p,
+.ProseMirror p {
+  margin: 0 0 0.85em;
+}
+
+.contract-editor p:last-child,
+.ProseMirror p:last-child {
+  margin-bottom: 0;
+}
+
+.export-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.export-row div {
+  display: grid;
+  gap: 2px;
+}
+
+.export-row strong {
+  color: var(--ink);
+  font-size: 1.35rem;
+}
+
+.export-row span {
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 .scope-panel {
@@ -558,6 +645,7 @@ h2 {
 
 .risk-block,
 .suggestion-block,
+.original-block,
 .law-reference {
   border-radius: var(--radius);
   padding: 14px;
@@ -573,6 +661,12 @@ h2 {
   color: #0f5132;
 }
 
+.original-block {
+  border: 1px solid var(--line);
+  background: #f8faf8;
+  color: #4f5f55;
+}
+
 .risk-title {
   margin-bottom: 6px;
   color: inherit;
@@ -580,8 +674,21 @@ h2 {
 }
 
 .risk-block p,
-.suggestion-block p {
+.suggestion-block p,
+.original-block p {
   margin: 0;
+}
+
+.quote-button {
+  border: 1px solid rgb(20 92 61 / 28%);
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 8px 12px;
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 850;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 .law-reference {
@@ -698,6 +805,7 @@ h2 {
   }
 
   .button-row,
+  .export-row,
   .risk-columns,
   .summary-band {
     grid-template-columns: 1fr;

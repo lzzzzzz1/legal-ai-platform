@@ -1,10 +1,13 @@
-import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
+import { EditorContent, useEditor } from "@tiptap/react";
+import StarterKit from "@tiptap/starter-kit";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type RiskLevel = "high" | "medium" | "low";
 
 type ReviewRisk = {
   item: string;
   level: RiskLevel;
+  original_text: string;
   risk: string;
   suggestion: string;
   laws?: string[];
@@ -12,7 +15,13 @@ type ReviewRisk = {
 
 type ReviewResponse = {
   filename: string;
+  contract_text?: string | null;
   risks: ReviewRisk[];
+};
+
+type Modification = {
+  original: string;
+  modified: string;
 };
 
 const levelLabel: Record<RiskLevel, string> = {
@@ -30,6 +39,7 @@ const levelOrder: Record<RiskLevel, number> = {
 const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
 const reviewScopes = ["合同份数", "签订地点", "联系人信息", "税务条款"];
+const emptyEditorHtml = "<p>上传并审查合同后，解析出的正文会显示在这里。</p>";
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
@@ -55,6 +65,28 @@ function formatFileSize(size: number) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function textToEditorHtml(text: string) {
+  const paragraphs = text
+    .split(/\r?\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+
+  if (!paragraphs.length) {
+    return emptyEditorHtml;
+  }
+
+  return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("");
+}
+
 async function reviewContract(file: File): Promise<ReviewResponse> {
   const formData = new FormData();
   formData.append("file", file);
@@ -72,12 +104,74 @@ async function reviewContract(file: File): Promise<ReviewResponse> {
   return response.json();
 }
 
+async function exportReviewedContract(file: File, modifications: Modification[]) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("modifications", JSON.stringify(modifications));
+
+  const response = await fetch("/api/export", {
+    method: "POST",
+    body: formData
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? "导出失败，请稍后重试。");
+  }
+
+  return response.blob();
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [review, setReview] = useState<ReviewResponse | null>(null);
+  const [modifications, setModifications] = useState<Modification[]>([]);
+  const [editorText, setEditorText] = useState("");
+  const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const editor = useEditor({
+    extensions: [StarterKit],
+    content: emptyEditorHtml,
+    editorProps: {
+      attributes: {
+        "aria-label": "合同正文编辑器",
+        class: "contract-editor"
+      }
+    },
+    onUpdate: ({ editor: activeEditor }) => {
+      setEditorText(activeEditor.getText({ blockSeparator: "\n" }));
+    }
+  });
+
+  useEffect(() => {
+    if (!editor) {
+      return;
+    }
+
+    if (review?.contract_text) {
+      editor.commands.setContent(textToEditorHtml(review.contract_text));
+      setEditorText(review.contract_text);
+      return;
+    }
+
+    editor.commands.setContent(emptyEditorHtml);
+    setEditorText("");
+  }, [editor, review?.contract_text]);
 
   const sortedRisks = useMemo(() => {
     return [...(review?.risks ?? [])].sort((left, right) => {
@@ -93,12 +187,21 @@ export default function App() {
   }, [sortedRisks]);
 
   const canSubmit = useMemo(() => Boolean(file) && !isLoading, [file, isLoading]);
+  const canExport = Boolean(file) && modifications.length > 0 && !isExporting;
   const totalRisks = sortedRisks.length;
+
+  function resetEditorState() {
+    setModifications([]);
+    setEditorNotice(null);
+    setEditorText("");
+    editor?.commands.setContent(emptyEditorHtml);
+  }
 
   function clearReview() {
     setFile(null);
     setReview(null);
     setError(null);
+    resetEditorState();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -108,6 +211,7 @@ export default function App() {
     const selectedFile = event.target.files?.[0] ?? null;
     setReview(null);
     setError(null);
+    resetEditorState();
 
     if (!selectedFile) {
       setFile(null);
@@ -140,6 +244,7 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     setReview(null);
+    resetEditorState();
 
     try {
       const result = await reviewContract(file);
@@ -148,6 +253,69 @@ export default function App() {
       setError(getErrorMessage(submitError));
     } finally {
       setIsLoading(false);
+    }
+  }
+
+  function applySuggestion(risk: ReviewRisk) {
+    if (!editor) {
+      setError("编辑器尚未准备好，请稍后重试。");
+      return;
+    }
+
+    if (!risk.original_text) {
+      setError("该风险项缺少合同原文定位，无法引用修改。");
+      return;
+    }
+
+    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
+    const originalIndex = currentText.indexOf(risk.original_text);
+
+    if (originalIndex === -1) {
+      setError("未在当前合同正文中找到对应原文，可能已被修改或模型返回的原文不完全一致。");
+      return;
+    }
+
+    const nextText = currentText.replace(risk.original_text, risk.suggestion);
+    editor.commands.setContent(textToEditorHtml(nextText));
+    setEditorText(nextText);
+    setError(null);
+    setEditorNotice(`已引用“${risk.item}”的修改建议。`);
+    setModifications((previous) => [
+      ...previous.filter((item) => item.original !== risk.original_text),
+      { original: risk.original_text, modified: risk.suggestion }
+    ]);
+
+    requestAnimationFrame(() => {
+      editor.commands.focus();
+      editor.commands.setTextSelection({
+        from: Math.max(1, originalIndex + 1),
+        to: Math.max(1, originalIndex + risk.suggestion.length + 1)
+      });
+    });
+  }
+
+  async function handleExport() {
+    if (!file) {
+      setError("请先选择一份 .docx 合同。");
+      return;
+    }
+
+    if (!modifications.length) {
+      setError("请先在风险卡片中引用至少一条修改建议。");
+      return;
+    }
+
+    setIsExporting(true);
+    setError(null);
+
+    try {
+      const blob = await exportReviewedContract(file, modifications);
+      downloadBlob(blob, "reviewed_contract.docx");
+      setEditorNotice("修改版合同已生成并开始下载。");
+    } catch (exportError) {
+      setError(getErrorMessage(exportError));
+    } finally {
+      setIsExporting(false);
     }
   }
 
@@ -166,7 +334,7 @@ export default function App() {
         <div className="system-strip">
           <span>Qdrant 法规库</span>
           <span>qwen-max 审查</span>
-          <span>text-embedding-v3 检索</span>
+          <span>Tiptap 在线编辑</span>
         </div>
       </header>
 
@@ -188,7 +356,7 @@ export default function App() {
               />
               <span className="file-kicker">{file ? "已载入合同" : "选择合同文件"}</span>
               <strong>{file ? file.name : "拖入或选择 .docx 文件"}</strong>
-              <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，保留纯文本审查链路`}</small>
+              <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，审查后可在线引用修改`}</small>
             </label>
 
             <div className="button-row">
@@ -211,6 +379,29 @@ export default function App() {
           ) : null}
 
           {error ? <p className="error-message">{error}</p> : null}
+          {editorNotice ? <p className="success-message">{editorNotice}</p> : null}
+
+          <section className="editor-panel" aria-label="合同正文编辑">
+            <div className="editor-heading">
+              <div>
+                <span className="section-label">Contract Draft</span>
+                <h2>合同正文</h2>
+              </div>
+              <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
+            </div>
+            <div className="editor-page">
+              <EditorContent editor={editor} />
+            </div>
+            <div className="export-row">
+              <div>
+                <strong>{modifications.length}</strong>
+                <span>条已引用修改</span>
+              </div>
+              <button className="primary-button" type="button" disabled={!canExport} onClick={handleExport}>
+                {isExporting ? "导出中" : "确认并导出修改版"}
+              </button>
+            </div>
+          </section>
 
           <div className="scope-panel" aria-label="审查范围">
             <p>本次审查范围</p>
@@ -263,20 +454,28 @@ export default function App() {
                   <strong>{sortedRisks.reduce((count, risk) => count + (risk.laws?.length ?? 0), 0)}</strong>
                 </div>
                 <div>
-                  <span>审查状态</span>
-                  <strong>完成</strong>
+                  <span>已引用</span>
+                  <strong>{modifications.length}</strong>
                 </div>
               </div>
 
               <div className="risk-list">
                 {sortedRisks.length ? (
-                  sortedRisks.map((risk) => (
-                    <article className={`risk-card risk-card-${risk.level}`} key={risk.item}>
+                  sortedRisks.map((risk, index) => (
+                    <article className={`risk-card risk-card-${risk.level}`} key={`${risk.item}-${index}`}>
                       <div className="risk-card-header">
                         <div>
                           <span>{levelLabel[risk.level]}</span>
                           <h3>{risk.item}</h3>
                         </div>
+                        <button className="quote-button" type="button" onClick={() => applySuggestion(risk)}>
+                          引用修改
+                        </button>
+                      </div>
+
+                      <div className="original-block">
+                        <p className="risk-title">定位原文</p>
+                        <p>{risk.original_text}</p>
                       </div>
 
                       <div className="risk-columns">

@@ -9,11 +9,13 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@tiptap/react": "^3.26.0",
+    "@tiptap/starter-kit": "^3.26.0",
     "@vitejs/plugin-react": "^4.3.4",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
