@@ -136,13 +136,14 @@ button:not(:disabled):active {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(360px, 560px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.9fr);
   gap: 22px;
   max-width: 1320px;
   margin: 0 auto;
 }
 
-.control-panel,
+.reader-panel,
+.review-sidebar,
 .result-panel {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -150,11 +151,28 @@ button:not(:disabled):active {
   box-shadow: 0 18px 52px rgb(37 49 43 / 8%);
 }
 
-.control-panel {
+.reader-panel {
   align-self: start;
   display: grid;
   gap: 20px;
   padding: 24px;
+}
+
+.review-sidebar {
+  align-self: start;
+  overflow: hidden;
+}
+
+.reader-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 370px);
+  gap: 18px;
+  align-items: start;
+}
+
+.reader-copy {
+  display: grid;
+  gap: 12px;
 }
 
 .panel-heading {
@@ -202,6 +220,10 @@ h1 {
 .review-form {
   display: grid;
   gap: 16px;
+}
+
+.review-form-inline {
+  align-self: stretch;
 }
 
 .file-drop {
@@ -339,6 +361,10 @@ h1 {
   gap: 14px;
 }
 
+.editor-panel-promoted {
+  gap: 16px;
+}
+
 .editor-heading {
   display: flex;
   align-items: flex-start;
@@ -371,6 +397,11 @@ h1 {
     linear-gradient(180deg, #ffffff 0%, #ffffff 74%, #fbfcfb 100%);
   padding: 30px;
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 60%);
+}
+
+.editor-page-promoted {
+  min-height: 720px;
+  max-height: calc(100dvh - 260px);
 }
 
 .contract-editor,
@@ -438,7 +469,7 @@ h1 {
 }
 
 .result-panel {
-  min-height: 640px;
+  min-height: 100%;
   padding: 24px;
 }
 
@@ -620,6 +651,13 @@ h2 {
   gap: 16px;
 }
 
+.risk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .risk-card-header span {
   display: inline-flex;
   margin-bottom: 8px;
@@ -701,6 +739,45 @@ h2 {
   font-weight: 850;
   cursor: pointer;
   white-space: nowrap;
+}
+
+.inline-button {
+  padding: 8px 12px;
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.manual-insert-panel {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8faf8;
+  padding: 14px;
+}
+
+.manual-insert-panel select {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink);
+  padding: 10px 12px;
+}
+
+.manual-insert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.manual-insert-actions .primary-button,
+.manual-insert-actions .secondary-button {
+  width: auto;
+}
+
+.sidebar-scope {
+  padding: 16px;
 }
 
 .law-reference {
@@ -791,8 +868,8 @@ h2 {
     grid-template-columns: 1fr;
   }
 
-  .control-panel {
-    position: static;
+  .reader-header {
+    grid-template-columns: 1fr;
   }
 
   h1 {
@@ -807,7 +884,8 @@ h2 {
   }
 
   .topbar,
-  .control-panel,
+  .reader-panel,
+  .review-sidebar,
   .result-panel {
     padding: 16px;
   }
@@ -819,7 +897,8 @@ h2 {
   .button-row,
   .export-row,
   .risk-columns,
-  .summary-band {
+  .summary-band,
+  .manual-insert-actions {
     grid-template-columns: 1fr;
   }
 
