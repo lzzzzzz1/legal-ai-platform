@@ -60,12 +60,36 @@ def _normalize_review_payload(payload: object) -> dict:
     raise ValueError("payload must include a risks array")
 
 
+def _normalize_risk_fields(payload: dict) -> dict:
+    risks = payload.get("risks")
+    if not isinstance(risks, list):
+        return payload
+
+    normalized_risks = []
+    for risk in risks:
+        if not isinstance(risk, dict):
+            normalized_risks.append(risk)
+            continue
+
+        normalized_risk = risk.copy()
+        laws = normalized_risk.get("laws")
+        if isinstance(laws, str):
+            normalized_risk["laws"] = [laws]
+        elif laws is None:
+            normalized_risk["laws"] = []
+
+        normalized_risks.append(normalized_risk)
+
+    return {**payload, "risks": normalized_risks}
+
+
 def parse_review_response(content: str, filename: str) -> ReviewResponse:
     payload = json.loads(content)
     normalized_payload = _normalize_review_payload(payload)
     # Remove contract_text from AI payload to prevent overriding
     # the backend-set value (which comes from the actual docx extraction).
     normalized_payload.pop("contract_text", None)
+    normalized_payload = _normalize_risk_fields(normalized_payload)
     return ReviewResponse(filename=filename, **normalized_payload)
 
 

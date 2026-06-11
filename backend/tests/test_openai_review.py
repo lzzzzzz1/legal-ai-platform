@@ -37,6 +37,20 @@ def test_parse_review_response_accepts_top_level_array() -> None:
     assert response.risks[0].laws == []
 
 
+def test_parse_review_response_normalizes_laws_string() -> None:
+    response = parse_review_response(
+        content=(
+            '{"risks":[{"item":"合同份数","level":"low",'
+            '"original_text":"合同份数未约定。",'
+            '"risk":"份数约定不清","suggestion":"明确一式几份。",'
+            '"laws":"《中华人民共和国民法典》第四百七十条"}]}'
+        ),
+        filename="contract.docx",
+    )
+
+    assert response.risks[0].laws == ["《中华人民共和国民法典》第四百七十条"]
+
+
 def test_parse_review_response_rejects_unknown_level() -> None:
     with pytest.raises(ValidationError):
         parse_review_response(
