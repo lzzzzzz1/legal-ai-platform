@@ -11,6 +11,7 @@ class ReviewRisk(BaseModel):
     level: RiskLevel
     risk: str
     suggestion: str
+    laws: list[str] = Field(default_factory=list, description="Referenced legal articles")
 
 
 class ReviewResponse(BaseModel):

@@ -10,11 +10,20 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=True)
 
 ARTICLE_PATTERN = re.compile(r"(第[零一二三四五六七八九十百千万\d]+条)")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "legal_laws")
 DEFAULT_SOURCE_FILE = Path(__file__).resolve().parents[1] / "tests" / "data" / "civil_code_sample.txt"
 EMBEDDING_DIMENSION = 1024
+
+
+def ensure_qdrant_no_proxy() -> None:
+    additions = ["qdrant", "localhost", "127.0.0.1"]
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = [item.strip() for item in os.getenv(key, "").split(",") if item.strip()]
+        merged = existing + [item for item in additions if item not in existing]
+        os.environ[key] = ",".join(merged)
 
 
 def split_law_articles(text: str) -> list[dict[str, str]]:
@@ -93,6 +102,7 @@ def ingest_laws(source_file: Path, law_name: str, collection_name: str = COLLECT
     vectors = embed_texts(embedding_client, [article["content"] for article in articles])
     points = build_points(law_name=law_name, articles=articles, vectors=vectors)
 
+    ensure_qdrant_no_proxy()
     qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
     ensure_collection(qdrant_client, collection_name=collection_name)
     qdrant_client.upsert(collection_name=collection_name, points=points)

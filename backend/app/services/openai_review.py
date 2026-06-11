@@ -7,6 +7,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from app.schemas.review import ReviewResponse
+from app.services.rag_service import format_laws_for_prompt, retrieve_relevant_laws
 
 load_dotenv()
 
@@ -17,6 +18,7 @@ MAX_CONTRACT_CHARS = 60000
 SYSTEM_PROMPT = (
     "你是一名资深合同审查律师。请分析合同条款，逐项检查："
     "合同份数、签订地点、联系人信息、税务条款。"
+    "你必须结合提供的参考法条提出修改建议，并在 suggestion 中写明引用的法律法规名称及条文号。"
     "只输出 JSON，不要输出 Markdown。"
 )
 
@@ -74,6 +76,15 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
         timeout=timeout_seconds,
     )
     model = os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL)
+    try:
+        relevant_laws = retrieve_relevant_laws(_trim_contract_text(contract_text))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"RAG law retrieval failed: {exc}",
+        ) from exc
+
+    law_context = format_laws_for_prompt(relevant_laws)
 
     try:
         response = client.chat.completions.create(
@@ -85,8 +96,11 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
                     "content": (
                         "请以 JSON 格式输出，格式必须是："
                         '{"risks":[{"item":"检查项","level":"high|medium|low",'
-                        '"risk":"风险提示","suggestion":"修改建议"}]}。'
-                        "level 只能使用 high、medium、low。\n\n"
+                        '"risk":"风险提示","suggestion":"修改建议",'
+                        '"laws":["《法规名称》第XXX条"]}]}。'
+                        "level 只能使用 high、medium、low。"
+                        "laws 必须列出本条建议引用的法规名称及条文号。\n\n"
+                        f"参考法条：\n{law_context}\n\n"
                         f"合同文本：\n{_trim_contract_text(contract_text)}"
                     ),
                 },

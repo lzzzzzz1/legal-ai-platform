@@ -6,6 +6,8 @@ services:
       - ./backend/.env
     environment:
       QDRANT_URL: http://qdrant:6333
+      NO_PROXY: qdrant,localhost,127.0.0.1
+      no_proxy: qdrant,localhost,127.0.0.1
     ports:
       - "8000:8000"
     depends_on:
