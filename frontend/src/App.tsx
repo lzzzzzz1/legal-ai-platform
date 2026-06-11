@@ -7,6 +7,7 @@ type ReviewRisk = {
   level: RiskLevel;
   risk: string;
   suggestion: string;
+  laws: string[];
 };
 
 type ReviewResponse = {
@@ -234,6 +235,16 @@ export default function App() {
                         <p className="risk-title">修改建议</p>
                         <p>{risk.suggestion}</p>
                       </div>
+                      {risk.laws.length ? (
+                        <details className="law-reference">
+                          <summary>参考法条依据</summary>
+                          <ul>
+                            {risk.laws.map((law) => (
+                              <li key={law}>{law}</li>
+                            ))}
+                          </ul>
+                        </details>
+                      ) : null}
                     </article>
                   ))
                 ) : (

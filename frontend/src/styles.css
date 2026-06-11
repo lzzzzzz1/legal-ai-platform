@@ -345,6 +345,27 @@ h2 {
   color: #05603a;
 }
 
+.law-reference {
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+  padding: 12px 14px;
+  line-height: 1.6;
+}
+
+.law-reference summary {
+  color: #334155;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.law-reference ul {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding-left: 18px;
+}
+
 .risk-title {
   margin: 0 0 6px;
   font-weight: 800;
