@@ -1,8 +1,10 @@
+import { Mark, mergeAttributes } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type RiskLevel = "high" | "medium" | "low";
+type RiskFilter = "all" | RiskLevel;
 
 type ReviewRisk = {
   item: string;
@@ -17,6 +19,7 @@ type ReviewRisk = {
 
 type ReviewResponse = {
   filename: string;
+  contract_type?: string | null;
   contract_text?: string | null;
   risks: ReviewRisk[];
 };
@@ -33,6 +36,48 @@ type ParagraphOption = {
   label: string;
 };
 
+type RiskWithKey = {
+  risk: ReviewRisk;
+  riskKey: string;
+};
+
+type FuzzyMatch = {
+  from: number;
+  to: number;
+  matchedText: string;
+  similarity: number;
+};
+
+const DeleteMark = Mark.create({
+  name: "deleted",
+  parseHTML() {
+    return [{ tag: "del" }, { tag: "span.del-mark" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["del", mergeAttributes(HTMLAttributes, { class: "del-mark" }), 0];
+  }
+});
+
+const InsertMark = Mark.create({
+  name: "inserted",
+  parseHTML() {
+    return [{ tag: "ins" }, { tag: "span.ins-mark" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["ins", mergeAttributes(HTMLAttributes, { class: "ins-mark" }), 0];
+  }
+});
+
+const PlaceholderLintMark = Mark.create({
+  name: "placeholderLint",
+  parseHTML() {
+    return [{ tag: "span.placeholder-lint-mark" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["span", mergeAttributes(HTMLAttributes, { class: "placeholder-lint-mark" }), 0];
+  }
+});
+
 const levelLabel: Record<RiskLevel, string> = {
   high: "高风险",
   medium: "中风险",
@@ -47,9 +92,12 @@ const levelOrder: Record<RiskLevel, number> = {
 
 const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
-const reviewScopes = ["合同份数", "签订地点", "联系人信息", "税务条款"];
+const reviewScopes = ["付款与发票", "交付与验收", "通知与争议", "责任与知识产权"];
 const emptyEditorHtml = "<p>上传并审查合同后，解析出的正文会显示在这里。</p>";
 const MISSING_SENTINEL = "【缺失该约定】";
+const placeholderPattern = /【[^】]+】/g;
+const clausePrefixPattern =
+  /^\s*(?:section\s+|article\s+)?(?:\(?\d+\)?|\(?[a-zA-Z]\)|[ivxlcdmIVXLCDM]+[.)]?|\d+(?:\.\d+)*[.)]?)\s*[:.)-]*\s*/i;
 
 function isMissingClause(originalText: string | undefined | null): boolean {
   if (!originalText) return true;
@@ -94,17 +142,36 @@ function escapeHtml(value: string) {
     .replace(/'/g, "&#039;");
 }
 
-function textToEditorHtml(text: string) {
-  const paragraphs = text
+function lintPlaceholders(html: string) {
+  return html.replace(placeholderPattern, (match) => `<span class="placeholder-lint-mark">${match}</span>`);
+}
+
+function renderPlainTextFragment(text: string) {
+  return lintPlaceholders(escapeHtml(text));
+}
+
+function textToParagraphs(text: string) {
+  return text
     .split(/\r?\n/)
     .map((paragraph) => paragraph.trim())
     .filter(Boolean);
+}
 
+function paragraphsToEditorHtml(paragraphs: string[]) {
   if (!paragraphs.length) {
     return emptyEditorHtml;
   }
 
-  return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("");
+  return paragraphs.map((paragraph) => `<p>${renderPlainTextFragment(paragraph)}</p>`).join("");
+}
+
+function textToEditorHtml(text: string) {
+  return paragraphsToEditorHtml(textToParagraphs(text));
+}
+
+function getHtmlParagraphs(html: string) {
+  const paragraphs = html.match(/<p\b[^>]*>[\s\S]*?<\/p>/g);
+  return paragraphs && paragraphs.length ? paragraphs : [emptyEditorHtml];
 }
 
 function editDistance(s1: string, s2: string): number {
@@ -150,7 +217,59 @@ function getSimilarity(s1: string, s2: string): number {
   return (longerLength - editDistance(longer, shorter)) / longerLength;
 }
 
-function findFuzzyMatch(fullText: string, query: string, threshold = 0.8) {
+function normalizeMatchText(text: string) {
+  return text.toLowerCase().replace(/[\W_]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
+function stripClausePrefix(text: string) {
+  return text.replace(clausePrefixPattern, "").trim();
+}
+
+function extractHeadingCandidate(text: string) {
+  const stripped = stripClausePrefix(text);
+  if (!stripped) {
+    return "";
+  }
+
+  const [heading] = stripped.split(/[.:\n;。；：]/, 1);
+  return heading && heading.length <= 80 ? heading.trim() : "";
+}
+
+function getParagraphMatchScore(paragraphText: string, query: string): number {
+  const paragraphFull = normalizeMatchText(paragraphText);
+  const queryFull = normalizeMatchText(query);
+
+  if (!paragraphFull || !queryFull) {
+    return 0;
+  }
+
+  if (paragraphFull === queryFull) {
+    return 1;
+  }
+
+  if (paragraphFull.includes(queryFull)) {
+    return 0.97;
+  }
+
+  const fullSimilarity = getSimilarity(paragraphFull, queryFull);
+  const paragraphHeading = normalizeMatchText(extractHeadingCandidate(paragraphText));
+  const queryHeading = normalizeMatchText(extractHeadingCandidate(query)) || queryFull;
+  let headingSimilarity = 0;
+
+  if (paragraphHeading) {
+    if (paragraphHeading === queryHeading) {
+      headingSimilarity = 0.96;
+    } else if (paragraphHeading.includes(queryHeading) || queryHeading.includes(paragraphHeading)) {
+      headingSimilarity = 0.93;
+    } else {
+      headingSimilarity = getSimilarity(paragraphHeading, queryHeading);
+    }
+  }
+
+  return Math.max(fullSimilarity, headingSimilarity);
+}
+
+function findFuzzyMatch(fullText: string, query: string, threshold = 0.8): FuzzyMatch | null {
   if (!query) {
     return null;
   }
@@ -169,7 +288,7 @@ function findFuzzyMatch(fullText: string, query: string, threshold = 0.8) {
   for (const paragraph of paragraphs) {
     const trimmed = paragraph.trim();
     if (trimmed.length > 0) {
-      const sim = getSimilarity(trimmed, query);
+      const sim = getParagraphMatchScore(trimmed, query);
       if (sim > bestSim) {
         bestSim = sim;
         bestParagraph = paragraph;
@@ -192,14 +311,61 @@ function findFuzzyMatch(fullText: string, query: string, threshold = 0.8) {
 }
 
 function normalizeParagraphs(text: string): ParagraphOption[] {
-  return text
-    .split(/\r?\n/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean)
-    .map((paragraph) => ({
-      anchor: paragraph,
-      label: paragraph.length > 56 ? `${paragraph.slice(0, 56)}...` : paragraph
-    }));
+  return textToParagraphs(text).map((paragraph) => ({
+    anchor: paragraph,
+    label: paragraph.length > 56 ? `${paragraph.slice(0, 56)}...` : paragraph
+  }));
+}
+
+function getInsertionAnchor(risk: ReviewRisk): string | null {
+  return risk.insert_after_text?.trim() || risk.anchor_text?.trim() || null;
+}
+
+function getRiskKey(risk: ReviewRisk, index: number) {
+  return `${risk.item}-${risk.original_text}-${index}`;
+}
+
+function getParagraphMetaFromOffset(text: string, offset: number) {
+  const paragraphs = textToParagraphs(text);
+  let currentOffset = 0;
+
+  for (let index = 0; index < paragraphs.length; index += 1) {
+    const paragraph = paragraphs[index];
+    const start = currentOffset;
+    const end = start + paragraph.length;
+    if (offset <= end) {
+      return { index, text: paragraph, start, end, paragraphs };
+    }
+    currentOffset = end + 1;
+  }
+
+  if (!paragraphs.length) {
+    return null;
+  }
+
+  const lastIndex = paragraphs.length - 1;
+  return {
+    index: lastIndex,
+    text: paragraphs[lastIndex],
+    start: Math.max(0, text.length - paragraphs[lastIndex].length),
+    end: text.length,
+    paragraphs
+  };
+}
+
+function buildReplacementDiffHtml(paragraphText: string, originalText: string, suggestion: string) {
+  const exactIndex = paragraphText.indexOf(originalText);
+  if (exactIndex >= 0) {
+    const prefix = paragraphText.slice(0, exactIndex);
+    const suffix = paragraphText.slice(exactIndex + originalText.length);
+    return `<p>${renderPlainTextFragment(prefix)}<del class="del-mark">${renderPlainTextFragment(originalText)}</del><ins class="ins-mark">${renderPlainTextFragment(suggestion)}</ins>${renderPlainTextFragment(suffix)}</p>`;
+  }
+
+  return `<p><del class="del-mark">${renderPlainTextFragment(paragraphText)}</del><ins class="ins-mark">${renderPlainTextFragment(suggestion)}</ins></p>`;
+}
+
+function buildInsertedParagraphHtml(suggestion: string) {
+  return `<p><ins class="ins-mark">${renderPlainTextFragment(suggestion)}</ins></p>`;
 }
 
 async function reviewContract(file: File): Promise<ReviewResponse> {
@@ -250,6 +416,10 @@ function downloadBlob(blob: Blob, filename: string) {
 
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const highlightedParagraphRef = useRef<HTMLElement | null>(null);
+  const insertionParagraphRef = useRef<HTMLElement | null>(null);
+  const riskCardRefs = useRef<Record<string, HTMLElement | null>>({});
+
   const [file, setFile] = useState<File | null>(null);
   const [review, setReview] = useState<ReviewResponse | null>(null);
   const [modifications, setModifications] = useState<Modification[]>([]);
@@ -260,41 +430,25 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [manualInsertRiskKey, setManualInsertRiskKey] = useState<string | null>(null);
   const [manualInsertAfterText, setManualInsertAfterText] = useState("");
-
-  const editor = useEditor({
-    extensions: [StarterKit],
-    content: emptyEditorHtml,
-    editorProps: {
-      attributes: {
-        "aria-label": "合同正文编辑器",
-        class: "contract-editor"
-      }
-    },
-    onUpdate: ({ editor: activeEditor }) => {
-      setEditorText(activeEditor.getText({ blockSeparator: "\n" }));
-    }
-  });
-
-  useEffect(() => {
-    if (!editor) {
-      return;
-    }
-
-    if (review?.contract_text) {
-      editor.commands.setContent(textToEditorHtml(review.contract_text));
-      setEditorText(review.contract_text);
-      return;
-    }
-
-    editor.commands.setContent(emptyEditorHtml);
-    setEditorText("");
-  }, [editor, review?.contract_text]);
+  const [activeRiskKey, setActiveRiskKey] = useState<string | null>(null);
+  const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
 
   const sortedRisks = useMemo(() => {
-    return [...(review?.risks ?? [])].sort((left, right) => {
-      return levelOrder[left.level] - levelOrder[right.level];
-    });
+    return [...(review?.risks ?? [])].sort((left, right) => levelOrder[left.level] - levelOrder[right.level]);
   }, [review]);
+
+  const risksWithKeys = useMemo<RiskWithKey[]>(() => {
+    return sortedRisks.map((risk, index) => ({ risk, riskKey: getRiskKey(risk, index) }));
+  }, [sortedRisks]);
+
+  const filteredRisks = useMemo(() => {
+    if (riskFilter === "all") {
+      return risksWithKeys;
+    }
+
+    return risksWithKeys.filter((entry) => entry.risk.level === riskFilter);
+  }, [riskFilter, risksWithKeys]);
 
   const riskCounts = useMemo(() => {
     return sortedRisks.reduce(
@@ -304,9 +458,110 @@ export default function App() {
   }, [sortedRisks]);
 
   const paragraphOptions = useMemo(() => normalizeParagraphs(editorText), [editorText]);
-  const canSubmit = useMemo(() => Boolean(file) && !isLoading, [file, isLoading]);
+  const canSubmit = Boolean(file) && !isLoading;
   const canExport = Boolean(file) && Boolean(review) && modifications.length > 0 && !isExporting;
   const totalRisks = sortedRisks.length;
+
+  function clearEditorHighlight() {
+    if (highlightedParagraphRef.current) {
+      highlightedParagraphRef.current.classList.remove("contract-paragraph-highlight");
+      highlightedParagraphRef.current = null;
+    }
+  }
+
+  function clearInsertionHighlight() {
+    if (insertionParagraphRef.current) {
+      insertionParagraphRef.current.classList.remove("contract-paragraph-insert-target");
+      insertionParagraphRef.current = null;
+    }
+  }
+
+  function applyInsertionHighlight(paragraph: HTMLElement | null) {
+    clearInsertionHighlight();
+    if (!paragraph) return;
+    paragraph.classList.add("contract-paragraph-insert-target");
+    insertionParagraphRef.current = paragraph;
+  }
+
+  const editor = useEditor(
+    {
+      extensions: [StarterKit, DeleteMark, InsertMark, PlaceholderLintMark],
+      content: emptyEditorHtml,
+      editable: false,
+      editorProps: {
+        attributes: {
+          "aria-label": "合同正文编辑器",
+          class: "contract-editor"
+        },
+        handleClick: (_view, _pos, event) => {
+          const target = event.target;
+          if (!(target instanceof HTMLElement)) {
+            return false;
+          }
+
+          const paragraph = target.closest("p");
+          if (!(paragraph instanceof HTMLElement)) {
+            return false;
+          }
+
+          const paragraphText = paragraph.innerText.trim();
+          if (!paragraphText) {
+            return false;
+          }
+
+          if (manualInsertRiskKey) {
+            setManualInsertAfterText(paragraphText);
+            applyInsertionHighlight(paragraph);
+            setEditorNotice("已选中插入位置，确认后会把补充条款插入到该段后面。");
+            setError(null);
+            paragraph.scrollIntoView({ behavior: "smooth", block: "center" });
+            return false;
+          }
+
+          let bestMatch: RiskWithKey | null = null;
+          let bestScore = 0;
+
+          for (const riskEntry of risksWithKeys) {
+            const candidate = isMissingClause(riskEntry.risk.original_text)
+              ? getInsertionAnchor(riskEntry.risk) ?? ""
+              : riskEntry.risk.original_text;
+            if (!candidate) continue;
+
+            const score = getParagraphMatchScore(paragraphText, candidate);
+            if (score > bestScore) {
+              bestScore = score;
+              bestMatch = riskEntry;
+            }
+          }
+
+          if (bestMatch && bestScore >= 0.78) {
+            setActiveRiskKey(bestMatch.riskKey);
+            riskCardRefs.current[bestMatch.riskKey]?.scrollIntoView({ behavior: "smooth", block: "center" });
+            setEditorNotice(`已在右侧定位到“${bestMatch.risk.item}”风险卡。`);
+          }
+
+          return false;
+        }
+      }
+    },
+    [manualInsertRiskKey, risksWithKeys]
+  );
+
+  useEffect(() => {
+    if (!editor) {
+      return;
+    }
+
+    if (review?.contract_text) {
+      const html = textToEditorHtml(review.contract_text);
+      editor.commands.setContent(html);
+      setEditorText(review.contract_text);
+      return;
+    }
+
+    editor.commands.setContent(emptyEditorHtml);
+    setEditorText("");
+  }, [editor, review?.contract_text]);
 
   function resetEditorState() {
     setModifications([]);
@@ -314,6 +569,11 @@ export default function App() {
     setEditorText("");
     setManualInsertRiskKey(null);
     setManualInsertAfterText("");
+    setActiveRiskKey(null);
+    setRiskFilter("all");
+    setIsSidebarCollapsed(false);
+    clearEditorHighlight();
+    clearInsertionHighlight();
     editor?.commands.setContent(emptyEditorHtml);
   }
 
@@ -386,8 +646,38 @@ export default function App() {
       editor.commands.setTextSelection({ from, to });
       const domNode = editor.view.domAtPos(Math.max(0, from - 1)).node as HTMLElement | Text;
       const element = domNode instanceof HTMLElement ? domNode : domNode.parentElement;
+      const paragraph = element?.closest("p");
+
+      clearEditorHighlight();
+      if (paragraph instanceof HTMLElement) {
+        paragraph.classList.add("contract-paragraph-highlight");
+        highlightedParagraphRef.current = paragraph;
+        paragraph.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+
       element?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
+  }
+
+  function locateRiskInEditor(risk: ReviewRisk) {
+    const candidate = isMissingClause(risk.original_text) ? getInsertionAnchor(risk) ?? "" : risk.original_text;
+    if (!candidate) {
+      return;
+    }
+
+    const match = findFuzzyMatch(editorText, candidate, isMissingClause(risk.original_text) ? 0.72 : 0.82);
+    if (!match) {
+      return;
+    }
+
+    revealEditorSelection(match.from + 1, match.to + 1);
+  }
+
+  function focusRisk(risk: ReviewRisk, riskKey: string) {
+    setActiveRiskKey(riskKey);
+    locateRiskInEditor(risk);
+    riskCardRefs.current[riskKey]?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   function applyMissingSuggestion(risk: ReviewRisk, anchorText: string | null) {
@@ -396,22 +686,29 @@ export default function App() {
       return;
     }
 
-    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
+    const currentText = editorText;
+    const currentHtml = editor.getHTML();
+    const htmlParagraphs = getHtmlParagraphs(currentHtml);
     const anchor = anchorText ?? "";
     const fuzzyAnchorMatch = anchor ? findFuzzyMatch(currentText, anchor, 0.72) : null;
-    const insertionIndex = fuzzyAnchorMatch ? fuzzyAnchorMatch.to : currentText.length;
-    const nextText =
-      currentText.slice(0, insertionIndex) +
-      "\n\n" +
-      risk.suggestion +
-      currentText.slice(insertionIndex);
+    const anchorMeta = fuzzyAnchorMatch ? getParagraphMetaFromOffset(currentText, fuzzyAnchorMatch.from) : null;
 
-    editor.commands.setContent(textToEditorHtml(nextText));
-    setEditorText(nextText);
+    const nextParagraphs = textToParagraphs(currentText);
+    const insertAtIndex = anchorMeta ? anchorMeta.index + 1 : nextParagraphs.length;
+    nextParagraphs.splice(insertAtIndex, 0, risk.suggestion);
+
+    const nextHtmlParagraphs = [...htmlParagraphs];
+    nextHtmlParagraphs.splice(insertAtIndex, 0, buildInsertedParagraphHtml(risk.suggestion));
+
+    editor.commands.setContent(nextHtmlParagraphs.join(""));
+    setEditorText(nextParagraphs.join("\n"));
     setError(null);
     setManualInsertRiskKey(null);
     setManualInsertAfterText("");
-    setEditorNotice(fuzzyAnchorMatch ? `已在指定段落后追加"${risk.item}"的补充条款。` : `已追加"${risk.item}"的补充条款到合同末尾。`);
+    clearInsertionHighlight();
+    setEditorNotice(
+      anchorMeta ? `已在指定段落后追加“${risk.item}”的补充条款。` : `已追加“${risk.item}”的补充条款到合同末尾。`
+    );
     setModifications((previous) => [
       ...previous.filter((item) => item.modified !== risk.suggestion),
       {
@@ -422,29 +719,8 @@ export default function App() {
       }
     ]);
 
-    revealEditorSelection(Math.max(1, insertionIndex + 1), Math.max(1, insertionIndex + risk.suggestion.length + 1));
-  }
-
-  function locateRiskInEditor(risk: ReviewRisk) {
-    if (!editor) {
-      return;
-    }
-
-    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
-    const candidate = isMissingClause(risk.original_text)
-      ? risk.insert_after_text ?? risk.anchor_text ?? ""
-      : risk.original_text;
-
-    if (!candidate) {
-      return;
-    }
-
-    const match = findFuzzyMatch(currentText, candidate, isMissingClause(risk.original_text) ? 0.72 : 0.82);
-    if (!match) {
-      return;
-    }
-
-    revealEditorSelection(match.from + 1, match.to + 1);
+    const insertedOffset = nextParagraphs.slice(0, insertAtIndex).join("\n").length + (insertAtIndex > 0 ? 1 : 0);
+    revealEditorSelection(Math.max(1, insertedOffset + 1), Math.max(1, insertedOffset + risk.suggestion.length + 1));
   }
 
   function applySuggestion(risk: ReviewRisk, riskKey: string) {
@@ -454,10 +730,11 @@ export default function App() {
     }
 
     const missing = isMissingClause(risk.original_text);
-    const currentText = editor.getText({ blockSeparator: "\n" }) || editorText;
+    const currentText = editorText;
+    setActiveRiskKey(riskKey);
 
     if (missing) {
-      const anchor = risk.insert_after_text ?? risk.anchor_text ?? "";
+      const anchor = getInsertionAnchor(risk) ?? "";
       const anchorMatch = anchor ? findFuzzyMatch(currentText, anchor, 0.72) : null;
 
       if (anchorMatch) {
@@ -467,7 +744,8 @@ export default function App() {
 
       setManualInsertRiskKey(riskKey);
       setManualInsertAfterText(paragraphOptions[0]?.anchor ?? "");
-      setEditorNotice(`"${risk.item}" 暂未锁定插入位置，请选择要插入到哪一段后面。`);
+      clearInsertionHighlight();
+      setEditorNotice(`“${risk.item}” 暂未锁定插入位置，请选择要插入到哪一段后面。`);
       setError(null);
       return;
     }
@@ -478,11 +756,24 @@ export default function App() {
       return;
     }
 
+    const paragraphMeta = getParagraphMetaFromOffset(currentText, originalMatch.from);
+    if (!paragraphMeta) {
+      setError("未能定位对应段落，请稍后重试。");
+      return;
+    }
+
     const nextText =
-      currentText.slice(0, originalMatch.from) +
-      risk.suggestion +
-      currentText.slice(originalMatch.to);
-    editor.commands.setContent(textToEditorHtml(nextText));
+      currentText.slice(0, originalMatch.from) + risk.suggestion + currentText.slice(originalMatch.to);
+    const currentHtml = editor.getHTML();
+    const htmlParagraphs = getHtmlParagraphs(currentHtml);
+    const nextHtmlParagraphs = [...htmlParagraphs];
+    nextHtmlParagraphs[paragraphMeta.index] = buildReplacementDiffHtml(
+      paragraphMeta.text,
+      risk.original_text,
+      risk.suggestion
+    );
+
+    editor.commands.setContent(nextHtmlParagraphs.join(""));
     setEditorText(nextText);
     setError(null);
     setEditorNotice(`已引用“${risk.item}”的修改建议。`);
@@ -496,10 +787,7 @@ export default function App() {
       }
     ]);
 
-    revealEditorSelection(
-      Math.max(1, originalMatch.from + 1),
-      Math.max(1, originalMatch.from + risk.suggestion.length + 1)
-    );
+    revealEditorSelection(Math.max(1, originalMatch.from + 1), Math.max(1, originalMatch.from + risk.suggestion.length + 1));
   }
 
   async function handleExport() {
@@ -527,6 +815,9 @@ export default function App() {
     }
   }
 
+  const currentFilename = review?.filename ?? file?.name ?? "未选择合同";
+  const currentFileSize = file ? formatFileSize(file.size) : null;
+
   return (
     <main className="app-shell">
       <header className="topbar" aria-label="应用状态">
@@ -536,7 +827,7 @@ export default function App() {
           </span>
           <div>
             <strong>Legal AI</strong>
-            <span>合同审查工作台</span>
+            <span>企业合同审阅工作台</span>
           </div>
         </div>
         <div className="system-strip">
@@ -546,40 +837,82 @@ export default function App() {
         </div>
       </header>
 
-      <section className="workspace" aria-busy={isLoading}>
+      <input
+        ref={fileInputRef}
+        className="hidden-file-input"
+        type="file"
+        accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        onChange={handleFileChange}
+      />
+
+      <section className={`workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`} aria-busy={isLoading}>
+        <button
+          className={`sidebar-toggle${isSidebarCollapsed ? " sidebar-toggle-collapsed" : ""}`}
+          type="button"
+          aria-label={isSidebarCollapsed ? "展开审查侧栏" : "折叠审查侧栏"}
+          onClick={() => setIsSidebarCollapsed((value) => !value)}
+        >
+          {isSidebarCollapsed ? "展开结果" : "收起结果"}
+        </button>
+
         <section className="reader-panel">
-          <div className="reader-header">
-            <div className="reader-copy">
-              <span className="status-chip">RAG 已启用</span>
-              <h1>上传合同，生成带法条依据的审查结果。</h1>
-              <p>左侧作为主阅读区进行审阅和确认，右侧集中展示风险、依据和插入动作。</p>
-            </div>
-
-            <form className="review-form review-form-inline" onSubmit={handleSubmit}>
-              <label className={`file-drop ${file ? "file-drop-active" : ""}`}>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                  onChange={handleFileChange}
-                />
-                <span className="file-kicker">{file ? "已载入合同" : "选择合同文件"}</span>
-                <strong>{file ? file.name : "拖入或选择 .docx 文件"}</strong>
-                <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，审查后可在线引用修改`}</small>
-              </label>
-
-              <div className="button-row">
-                <button className="primary-button" type="submit" disabled={!canSubmit}>
-                  {isLoading ? "审查中" : review ? "重新审查" : "开始审查"}
-                </button>
-                {(file || review || error) && !isLoading ? (
-                  <button className="secondary-button" type="button" onClick={clearReview}>
-                    清空
-                  </button>
-                ) : null}
+          {!review ? (
+            <div className="reader-header">
+              <div className="reader-copy">
+                <span className="status-chip">RAG 已启用</span>
+                <h1>上传企业合同，生成带法条依据的审查结果。</h1>
+                <p>主区用于审阅正文和修订痕迹，右侧集中展示风险、法条依据与引用动作。</p>
               </div>
-            </form>
-          </div>
+
+              <form className="review-form review-form-inline" onSubmit={handleSubmit}>
+                <button
+                  className={`file-drop ${file ? "file-drop-active" : ""}`}
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <span className="file-kicker">{file ? "已载入合同" : "选择合同文件"}</span>
+                  <strong>{file ? file.name : "拖入或选择 .docx 文件"}</strong>
+                  <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，审查后可在线引用修改`}</small>
+                </button>
+
+                <div className="button-row">
+                  <button className="primary-button" type="submit" disabled={!canSubmit}>
+                    {isLoading ? "审查中" : "开始审查"}
+                  </button>
+                  {(file || error) && !isLoading ? (
+                    <button className="secondary-button" type="button" onClick={clearReview}>
+                      清空
+                    </button>
+                  ) : null}
+                </div>
+              </form>
+            </div>
+          ) : (
+            <div className="compact-document-bar">
+              <div className="document-info">
+                <span className="document-icon" aria-hidden="true">
+                  📄
+                </span>
+                <div>
+                  <strong>{currentFilename}</strong>
+                  <span className="document-size">
+                    {currentFileSize ?? "文件已载入"} · {review.contract_type ?? "通用商务合同"}
+                  </span>
+                </div>
+              </div>
+              <div className="compact-document-actions">
+                <button className="compact-reupload-btn" type="button" onClick={() => fileInputRef.current?.click()}>
+                  重新上传
+                </button>
+                <button className="secondary-button compact-clear-btn" type="button" onClick={clearReview}>
+                  清空
+                </button>
+                <button className="primary-button compact-review-btn" type="button" disabled={!canSubmit} onClick={(event) => void handleSubmit(event as never)}>
+                  {isLoading ? "审查中" : "重新审查"}
+                </button>
+              </div>
+            </div>
+          )}
 
           {isLoading ? (
             <div className="process-panel" role="status" aria-live="polite">
@@ -596,12 +929,21 @@ export default function App() {
               <div>
                 <span className="section-label">Contract Draft</span>
                 <h2>合同正文</h2>
+                <p className="editor-subtitle">红线删除旧词，绿底高亮新增建议。占位符会以本地提示样式标记，方便复核。</p>
               </div>
               <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
             </div>
-            <div className="editor-page editor-page-promoted">
+
+            {manualInsertRiskKey ? (
+              <div className="editor-mode-banner" role="status" aria-live="polite">
+                正在手动选择插入位置：点击正文中的目标段落，补充条款会插入到该段后面。
+              </div>
+            ) : null}
+
+            <div className={`editor-page editor-page-promoted${isSidebarCollapsed ? " editor-page-focus" : ""}`}>
               <EditorContent editor={editor} />
             </div>
+
             <div className="export-row">
               <div>
                 <strong>{modifications.length}</strong>
@@ -614,12 +956,13 @@ export default function App() {
           </section>
         </section>
 
-        <aside className="review-sidebar">
+        <aside className={`review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
           <section className="result-panel">
             <div className="result-header">
               <div>
                 <span className="section-label">Review Result</span>
                 <h2>{review?.filename ?? "等待合同上传"}</h2>
+                {review?.contract_type ? <p className="result-subtitle">合同类型：{review.contract_type}</p> : null}
               </div>
               <div className="score-summary" aria-label="风险统计">
                 <span className="score-high">高 {riskCounts.high}</span>
@@ -670,32 +1013,84 @@ export default function App() {
                   </div>
                 </div>
 
+                <div className="risk-filter-bar" role="tablist" aria-label="风险筛选">
+                  <button
+                    className={`filter-chip${riskFilter === "all" ? " filter-chip-active" : ""}`}
+                    type="button"
+                    onClick={() => setRiskFilter("all")}
+                  >
+                    全部 {sortedRisks.length}
+                  </button>
+                  <button
+                    className={`filter-chip${riskFilter === "high" ? " filter-chip-active" : ""}`}
+                    type="button"
+                    onClick={() => setRiskFilter("high")}
+                  >
+                    高风险 {riskCounts.high}
+                  </button>
+                  <button
+                    className={`filter-chip${riskFilter === "medium" ? " filter-chip-active" : ""}`}
+                    type="button"
+                    onClick={() => setRiskFilter("medium")}
+                  >
+                    中风险 {riskCounts.medium}
+                  </button>
+                  <button
+                    className={`filter-chip${riskFilter === "low" ? " filter-chip-active" : ""}`}
+                    type="button"
+                    onClick={() => setRiskFilter("low")}
+                  >
+                    低风险 {riskCounts.low}
+                  </button>
+                </div>
+
                 <div className="risk-list">
-                  {sortedRisks.length ? (
-                    sortedRisks.map((risk, index) => {
-                      const riskKey = `${risk.item}-${index}`;
+                  {filteredRisks.length ? (
+                    filteredRisks.map(({ risk, riskKey }) => {
                       const showManualInsert = manualInsertRiskKey === riskKey && isMissingClause(risk.original_text);
+                      const accepted = modifications.some(
+                        (item) => item.original === risk.original_text || item.modified === risk.suggestion
+                      );
 
                       return (
-                        <article className={`risk-card risk-card-${risk.level}`} key={riskKey}>
+                        <article
+                          ref={(element) => {
+                            riskCardRefs.current[riskKey] = element;
+                          }}
+                          className={`risk-card risk-card-${risk.level}${activeRiskKey === riskKey ? " risk-card-active" : ""}`}
+                          key={riskKey}
+                        >
                           <div className="risk-card-header">
                             <div>
-                              <span>{levelLabel[risk.level]}</span>
+                              <div className="risk-chip-row">
+                                <span>{levelLabel[risk.level]}</span>
+                                <span className={`acceptance-chip${accepted ? " acceptance-chip-done" : ""}`}>
+                                  {accepted ? "已接受" : "待处理"}
+                                </span>
+                              </div>
                               <h3>{risk.item}</h3>
                             </div>
                             <div className="risk-actions">
-                              <button className="secondary-button inline-button" type="button" onClick={() => locateRiskInEditor(risk)}>
+                              <button className="secondary-button inline-button" type="button" onClick={() => focusRisk(risk, riskKey)}>
                                 定位正文
                               </button>
-                              <button className={`quote-button${isMissingClause(risk.original_text) ? " quote-append" : ""}`} type="button" onClick={() => applySuggestion(risk, riskKey)}>
+                              <button
+                                className={`quote-button${isMissingClause(risk.original_text) ? " quote-append" : ""}`}
+                                type="button"
+                                onClick={() => applySuggestion(risk, riskKey)}
+                              >
                                 {isMissingClause(risk.original_text) ? "追加条款" : "引用修改"}
                               </button>
                             </div>
                           </div>
 
                           <div className={`original-block${isMissingClause(risk.original_text) ? " original-missing" : ""}`}>
-                            <p className="risk-title">定位原文</p>
-                            <p>{isMissingClause(risk.original_text) ? "合同中缺失该约定，建议补充。" : risk.original_text}</p>
+                            <p className="risk-title">{isMissingClause(risk.original_text) ? "建议插入位置" : "定位原文"}</p>
+                            <p>
+                              {isMissingClause(risk.original_text)
+                                ? getInsertionAnchor(risk) ?? "合同中缺失该约定，暂未锁定明确插入位置，可手动选择段落。"
+                                : risk.original_text}
+                            </p>
                           </div>
 
                           <div className="risk-columns">
@@ -712,6 +1107,7 @@ export default function App() {
                           {showManualInsert ? (
                             <div className="manual-insert-panel">
                               <p className="risk-title">选择插入位置</p>
+                              <p className="manual-insert-hint">可以直接点击左侧正文中的目标段落，或在下方列表中选择。</p>
                               <select value={manualInsertAfterText} onChange={(event) => setManualInsertAfterText(event.target.value)}>
                                 {paragraphOptions.map((option) => (
                                   <option key={option.anchor} value={option.anchor}>
@@ -734,6 +1130,7 @@ export default function App() {
                                   onClick={() => {
                                     setManualInsertRiskKey(null);
                                     setManualInsertAfterText("");
+                                    clearInsertionHighlight();
                                   }}
                                 >
                                   取消
@@ -757,8 +1154,8 @@ export default function App() {
                     })
                   ) : (
                     <div className="no-risk-state">
-                      <p>本次未识别到明确风险项。</p>
-                      <span>建议仍由法务人员进行最终复核。</span>
+                      <p>{sortedRisks.length ? "当前筛选条件下暂无风险项。" : "本次未识别到明确风险项。"}</p>
+                      <span>{sortedRisks.length ? "可以切换回全部结果继续查看。" : "建议仍由法务人员进行最终复核。"}</span>
                     </div>
                   )}
                 </div>
