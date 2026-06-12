@@ -2,6 +2,12 @@ import { Mark, mergeAttributes } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  findFuzzyMatch,
+  getParagraphMatchScore,
+  isMissingClause,
+  MISSING_SENTINEL
+} from "./reviewUtils";
 
 type RiskLevel = "high" | "medium" | "low";
 type RiskFilter = "all" | RiskLevel;
@@ -39,13 +45,6 @@ type ParagraphOption = {
 type RiskWithKey = {
   risk: ReviewRisk;
   riskKey: string;
-};
-
-type FuzzyMatch = {
-  from: number;
-  to: number;
-  matchedText: string;
-  similarity: number;
 };
 
 const DeleteMark = Mark.create({
@@ -94,16 +93,7 @@ const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
 const reviewScopes = ["付款与发票", "交付与验收", "通知与争议", "责任与知识产权"];
 const emptyEditorHtml = "<p>上传并审查合同后，解析出的正文会显示在这里。</p>";
-const MISSING_SENTINEL = "【缺失该约定】";
 const placeholderPattern = /【[^】]+】/g;
-const clausePrefixPattern =
-  /^\s*(?:section\s+|article\s+)?(?:\(?\d+\)?|\(?[a-zA-Z]\)|[ivxlcdmIVXLCDM]+[.)]?|\d+(?:\.\d+)*[.)]?)\s*[:.)-]*\s*/i;
-
-function isMissingClause(originalText: string | undefined | null): boolean {
-  if (!originalText) return true;
-  const trimmed = originalText.trim();
-  return trimmed === "" || trimmed === MISSING_SENTINEL || trimmed === "缺失该约定";
-}
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
@@ -172,142 +162,6 @@ function textToEditorHtml(text: string) {
 function getHtmlParagraphs(html: string) {
   const paragraphs = html.match(/<p\b[^>]*>[\s\S]*?<\/p>/g);
   return paragraphs && paragraphs.length ? paragraphs : [emptyEditorHtml];
-}
-
-function editDistance(s1: string, s2: string): number {
-  const left = s1.toLowerCase();
-  const right = s2.toLowerCase();
-  const costs: number[] = [];
-
-  for (let i = 0; i <= left.length; i += 1) {
-    let lastValue = i;
-    for (let j = 0; j <= right.length; j += 1) {
-      if (i === 0) {
-        costs[j] = j;
-      } else if (j > 0) {
-        let newValue = costs[j - 1];
-        if (left.charAt(i - 1) !== right.charAt(j - 1)) {
-          newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
-        }
-        costs[j - 1] = lastValue;
-        lastValue = newValue;
-      }
-    }
-    if (i > 0) {
-      costs[right.length] = lastValue;
-    }
-  }
-
-  return costs[right.length];
-}
-
-function getSimilarity(s1: string, s2: string): number {
-  let longer = s1;
-  let shorter = s2;
-  if (s1.length < s2.length) {
-    longer = s2;
-    shorter = s1;
-  }
-
-  const longerLength = longer.length;
-  if (longerLength === 0) {
-    return 1;
-  }
-
-  return (longerLength - editDistance(longer, shorter)) / longerLength;
-}
-
-function normalizeMatchText(text: string) {
-  return text.toLowerCase().replace(/[\W_]+/g, " ").trim().replace(/\s+/g, " ");
-}
-
-function stripClausePrefix(text: string) {
-  return text.replace(clausePrefixPattern, "").trim();
-}
-
-function extractHeadingCandidate(text: string) {
-  const stripped = stripClausePrefix(text);
-  if (!stripped) {
-    return "";
-  }
-
-  const [heading] = stripped.split(/[.:\n;。；：]/, 1);
-  return heading && heading.length <= 80 ? heading.trim() : "";
-}
-
-function getParagraphMatchScore(paragraphText: string, query: string): number {
-  const paragraphFull = normalizeMatchText(paragraphText);
-  const queryFull = normalizeMatchText(query);
-
-  if (!paragraphFull || !queryFull) {
-    return 0;
-  }
-
-  if (paragraphFull === queryFull) {
-    return 1;
-  }
-
-  if (paragraphFull.includes(queryFull)) {
-    return 0.97;
-  }
-
-  const fullSimilarity = getSimilarity(paragraphFull, queryFull);
-  const paragraphHeading = normalizeMatchText(extractHeadingCandidate(paragraphText));
-  const queryHeading = normalizeMatchText(extractHeadingCandidate(query)) || queryFull;
-  let headingSimilarity = 0;
-
-  if (paragraphHeading) {
-    if (paragraphHeading === queryHeading) {
-      headingSimilarity = 0.96;
-    } else if (paragraphHeading.includes(queryHeading) || queryHeading.includes(paragraphHeading)) {
-      headingSimilarity = 0.93;
-    } else {
-      headingSimilarity = getSimilarity(paragraphHeading, queryHeading);
-    }
-  }
-
-  return Math.max(fullSimilarity, headingSimilarity);
-}
-
-function findFuzzyMatch(fullText: string, query: string, threshold = 0.8): FuzzyMatch | null {
-  if (!query) {
-    return null;
-  }
-
-  const exactIdx = fullText.indexOf(query);
-  if (exactIdx >= 0) {
-    return { from: exactIdx, to: exactIdx + query.length, matchedText: query, similarity: 1 };
-  }
-
-  const paragraphs = fullText.split("\n");
-  let bestSim = 0;
-  let bestParagraph = "";
-  let currentOffset = 0;
-  let bestOffset = -1;
-
-  for (const paragraph of paragraphs) {
-    const trimmed = paragraph.trim();
-    if (trimmed.length > 0) {
-      const sim = getParagraphMatchScore(trimmed, query);
-      if (sim > bestSim) {
-        bestSim = sim;
-        bestParagraph = paragraph;
-        bestOffset = currentOffset;
-      }
-    }
-    currentOffset += paragraph.length + 1;
-  }
-
-  if (bestSim >= threshold && bestOffset >= 0) {
-    return {
-      from: bestOffset,
-      to: bestOffset + bestParagraph.length,
-      matchedText: bestParagraph,
-      similarity: bestSim
-    };
-  }
-
-  return null;
 }
 
 function normalizeParagraphs(text: string): ParagraphOption[] {

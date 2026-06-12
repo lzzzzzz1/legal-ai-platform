@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node scripts/run-review-utils-tests.mjs"
   },
   "dependencies": {
     "@tiptap/react": "^3.26.0",
