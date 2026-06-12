@@ -9,7 +9,7 @@ from app.services.openai_review import parse_review_response, review_contract_te
 def test_parse_review_response_accepts_risks_object() -> None:
     response = parse_review_response(
         content=(
-            '{"risks":[{"item":"税务条款","level":"high",'
+            '{"contract_type":"采购合同","risks":[{"item":"税务条款","level":"high",'
             '"original_text":"税费承担未约定。",'
             '"risk":"缺少税费承担约定","suggestion":"补充税费承担主体。",'
             '"laws":["《中华人民共和国民法典》第四百七十条"]}]}'
@@ -18,6 +18,7 @@ def test_parse_review_response_accepts_risks_object() -> None:
     )
 
     assert response.filename == "contract.docx"
+    assert response.contract_type == "采购/供应合同"
     assert response.risks[0].item == "税务条款"
     assert response.risks[0].original_text == "税费承担未约定。"
     assert response.risks[0].laws == ["《中华人民共和国民法典》第四百七十条"]
@@ -34,6 +35,7 @@ def test_parse_review_response_accepts_top_level_array() -> None:
     )
 
     assert response.risks[0].level == "low"
+    assert response.contract_type is None
     assert response.risks[0].laws == []
 
 
@@ -49,6 +51,19 @@ def test_parse_review_response_normalizes_laws_string() -> None:
     )
 
     assert response.risks[0].laws == ["《中华人民共和国民法典》第四百七十条"]
+
+
+def test_parse_review_response_normalizes_unknown_contract_type_to_business_default() -> None:
+    response = parse_review_response(
+        content=(
+            '{"contract_type":"框架合作协议","risks":[{"item":"通知条款","level":"medium",'
+            '"original_text":"联系人未约定。",'
+            '"risk":"缺少通知联系人","suggestion":"补充通知联系人与送达方式。"}]}'
+        ),
+        filename="contract.docx",
+    )
+
+    assert response.contract_type == "通用商务合同"
 
 
 def test_parse_review_response_rejects_unknown_level() -> None:
@@ -93,7 +108,7 @@ def test_review_contract_text_injects_retrieved_laws(monkeypatch) -> None:
                                     (),
                                     {
                                         "content": (
-                                            '{"risks":[{"item":"签订地点","level":"medium",'
+                                            '{"contract_type":"服务合同","risks":[{"item":"签订地点","level":"medium",'
                                             '"original_text":"合同约定履行地点不明确。",'
                                             '"risk":"履行地点约定不明确",'
                                             '"suggestion":"根据《中华人民共和国民法典》第五百一十一条补充履行地点。",'
@@ -133,6 +148,9 @@ def test_review_contract_text_injects_retrieved_laws(monkeypatch) -> None:
 
     user_prompt = captured_messages["messages"][1]["content"]
     assert "参考法条" in user_prompt
+    assert "contract_type" in user_prompt
+    assert "采购/供应合同|销售/服务合同|保密协议|通用商务合同" in user_prompt
     assert "original_text" in user_prompt
     assert "《中华人民共和国民法典》第五百一十一条" in user_prompt
+    assert response.contract_type == "销售/服务合同"
     assert response.risks[0].laws == ["《中华人民共和国民法典》第五百一十一条"]

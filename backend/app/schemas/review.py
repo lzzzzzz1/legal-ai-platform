@@ -19,5 +19,6 @@ class ReviewRisk(BaseModel):
 
 class ReviewResponse(BaseModel):
     filename: str
+    contract_type: str | None = Field(default=None, description="Detected enterprise contract type")
     contract_text: str | None = Field(default=None, description="Plain text extracted from the uploaded contract")
     risks: list[ReviewRisk]
