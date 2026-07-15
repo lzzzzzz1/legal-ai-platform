@@ -94,9 +94,12 @@ const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
 const reviewScopes = ["付款与发票", "交付与验收", "通知与争议", "责任与知识产权"];
 const emptyEditorHtml = "<p>上传并审查合同后，解析出的正文会显示在这里。</p>";
 const placeholderPattern = /【[^】]+】/g;
+const unsupportedEditorCharacters = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
+    const normalizedMessage = error.message.toLowerCase();
+
     if (error.message === "Not Found") {
       return "导出接口暂未在运行中的后端生效，请重启或重建后端服务后再试。";
     }
@@ -105,7 +108,12 @@ function getErrorMessage(error: unknown) {
       return "百炼 API Key 未配置或未进入容器，请检查 backend/.env 后重启后端服务。";
     }
 
-    if (error.message.toLowerCase().includes("timeout")) {
+    if (
+      normalizedMessage.includes("timeout")
+      || normalizedMessage.includes("timed out")
+      || normalizedMessage.includes("504")
+      || normalizedMessage.includes("gateway time-out")
+    ) {
       return "模型审查超时，请稍后重试，或适当精简合同内容。";
     }
 
@@ -156,7 +164,7 @@ function paragraphsToEditorHtml(paragraphs: string[]) {
 }
 
 function textToEditorHtml(text: string) {
-  return paragraphsToEditorHtml(textToParagraphs(text));
+  return paragraphsToEditorHtml(textToParagraphs(text.replace(unsupportedEditorCharacters, "")));
 }
 
 function getHtmlParagraphs(html: string) {
@@ -233,10 +241,69 @@ async function reviewContract(file: File): Promise<ReviewResponse> {
 
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? "后端服务暂时不可用。");
+    throw new Error(payload?.detail ?? `Review request failed with status ${response.status}.`);
   }
 
-  return response.json();
+  return normalizeReviewResponse(await response.json(), file.name);
+}
+
+function normalizeReviewResponse(payload: unknown, fallbackFilename: string): ReviewResponse {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("审查服务返回了无法识别的数据。");
+  }
+
+  const source = payload as Record<string, unknown>;
+  if (typeof source.contract_text !== "string" || !source.contract_text.trim()) {
+    throw new Error("审查服务未返回可显示的合同正文。");
+  }
+
+  if (!Array.isArray(source.risks)) {
+    throw new Error("审查服务返回的风险列表格式不正确。");
+  }
+
+  const risks: ReviewRisk[] = source.risks.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`第 ${index + 1} 条风险数据格式不正确。`);
+    }
+
+    const risk = entry as Record<string, unknown>;
+    const level = risk.level;
+    if (level !== "high" && level !== "medium" && level !== "low") {
+      throw new Error(`第 ${index + 1} 条风险缺少有效等级。`);
+    }
+
+    const requiredFields = ["item", "original_text", "risk", "suggestion"] as const;
+    for (const field of requiredFields) {
+      if (typeof risk[field] !== "string") {
+        throw new Error(`第 ${index + 1} 条风险缺少 ${field}。`);
+      }
+    }
+
+    const rawLaws = risk.laws;
+    const laws = Array.isArray(rawLaws)
+      ? rawLaws.filter((law): law is string => typeof law === "string")
+      : typeof rawLaws === "string"
+        ? [rawLaws]
+        : [];
+
+    return {
+      item: risk.item as string,
+      level,
+      original_text: risk.original_text as string,
+      anchor_text: typeof risk.anchor_text === "string" ? risk.anchor_text : null,
+      insert_after_text: typeof risk.insert_after_text === "string" ? risk.insert_after_text : null,
+      risk: risk.risk as string,
+      suggestion: risk.suggestion as string,
+      laws
+    };
+  });
+
+  return {
+    filename: typeof source.filename === "string" && source.filename ? source.filename : fallbackFilename,
+    contract_type: typeof source.contract_type === "string" ? source.contract_type : null,
+    contract_text: source.contract_text.replace(unsupportedEditorCharacters, ""),
+    risks
+  };
 }
 
 async function exportReviewedContract(file: File, modifications: Modification[]) {
@@ -251,7 +318,7 @@ async function exportReviewedContract(file: File, modifications: Modification[])
 
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? "导出失败，请稍后重试。");
+    throw new Error(payload?.detail ?? `Export request failed with status ${response.status}.`);
   }
 
   return response.blob();
@@ -287,6 +354,7 @@ export default function App() {
   const [activeRiskKey, setActiveRiskKey] = useState<string | null>(null);
   const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isSystemStatusOpen, setIsSystemStatusOpen] = useState(false);
 
   const sortedRisks = useMemo(() => {
     return [...(review?.risks ?? [])].sort((left, right) => levelOrder[left.level] - levelOrder[right.level]);
@@ -346,7 +414,19 @@ export default function App() {
         attributes: {
           "aria-label": "合同正文编辑器",
           class: "contract-editor"
-        },
+        }
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) {
+      return;
+    }
+
+    editor.setOptions({
+      editorProps: {
         handleClick: (_view, _pos, event) => {
           const target = event.target;
           if (!(target instanceof HTMLElement)) {
@@ -397,19 +477,26 @@ export default function App() {
           return false;
         }
       }
-    },
-    [manualInsertRiskKey, risksWithKeys]
-  );
+    });
+  }, [editor, manualInsertRiskKey, risksWithKeys]);
 
   useEffect(() => {
-    if (!editor) {
+    if (!editor || editor.isDestroyed) {
       return;
     }
 
     if (review?.contract_text) {
-      const html = textToEditorHtml(review.contract_text);
-      editor.commands.setContent(html);
-      setEditorText(review.contract_text);
+      try {
+        const safeContractText = review.contract_text.replace(unsupportedEditorCharacters, "");
+        const html = textToEditorHtml(safeContractText);
+        editor.commands.setContent(html);
+        setEditorText(safeContractText);
+      } catch (editorError) {
+        console.error("合同正文载入编辑器失败", editorError);
+        editor.commands.setContent(emptyEditorHtml);
+        setEditorText("");
+        setError("审查结果已生成，但合同正文无法载入编辑器。请刷新页面后重新上传该文件。");
+      }
       return;
     }
 
@@ -441,8 +528,7 @@ export default function App() {
     }
   }
 
-  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const selectedFile = event.target.files?.[0] ?? null;
+  function handleFileSelection(selectedFile: File | null) {
     setReview(null);
     setError(null);
     resetEditorState();
@@ -467,8 +553,15 @@ export default function App() {
     setFile(selectedFile);
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFile = event.target.files?.[0] ?? null;
+    handleFileSelection(selectedFile);
+  }
+
+  async function handleSubmit(event?: FormEvent) {
+    if (event) {
+      event.preventDefault();
+    }
 
     if (!file) {
       setError("请先选择一份 .docx 合同。");
@@ -684,10 +777,32 @@ export default function App() {
             <span>企业合同审阅工作台</span>
           </div>
         </div>
-        <div className="system-strip">
-          <span>Qdrant 法规库</span>
-          <span>qwen-max 审查</span>
-          <span>Tiptap 审阅草稿</span>
+        <div className="system-status-container">
+          <button
+            className="system-status-btn"
+            type="button"
+            onClick={() => setIsSystemStatusOpen((prev) => !prev)}
+            aria-expanded={isSystemStatusOpen}
+          >
+            <span className="status-indicator-dot"></span>
+            系统状态
+          </button>
+          {isSystemStatusOpen && (
+            <div className="system-status-dropdown">
+              <div className="dropdown-item">
+                <span className="dropdown-label">知识库</span>
+                <span className="dropdown-value">Qdrant 法规库 (已连接)</span>
+              </div>
+              <div className="dropdown-item">
+                <span className="dropdown-label">审查模型</span>
+                <span className="dropdown-value">Qwen-Max</span>
+              </div>
+              <div className="dropdown-item">
+                <span className="dropdown-label">在线编辑</span>
+                <span className="dropdown-value">Tiptap 审阅草稿</span>
+              </div>
+            </div>
+          )}
         </div>
       </header>
 
@@ -699,49 +814,102 @@ export default function App() {
         onChange={handleFileChange}
       />
 
-      <section className={`workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`} aria-busy={isLoading}>
-        <button
-          className={`sidebar-toggle${isSidebarCollapsed ? " sidebar-toggle-collapsed" : ""}`}
-          type="button"
-          aria-label={isSidebarCollapsed ? "展开审查侧栏" : "折叠审查侧栏"}
-          onClick={() => setIsSidebarCollapsed((value) => !value)}
-        >
-          {isSidebarCollapsed ? "展开结果" : "收起结果"}
-        </button>
+      {!review ? (
+        <div className="upload-container">
+          <div className="upload-header">
+            <h1>上传合同，生成可追溯法规依据的审查建议。</h1>
+            <p>审查完成后，可在原文中定位风险条款并查看修改建议。</p>
+          </div>
 
-        <section className="reader-panel">
-          {!review ? (
-            <div className="reader-header">
-              <div className="reader-copy">
-                <span className="status-chip">RAG 已启用</span>
-                <h1>上传企业合同，生成带法条依据的审查结果。</h1>
-                <p>主区用于审阅正文和修订痕迹，右侧集中展示风险、法条依据与引用动作。</p>
+          <div className="upload-card">
+            <div
+              className={`upload-dropzone ${file ? "upload-dropzone-active" : ""}`}
+              onClick={() => !isLoading && fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (isLoading) return;
+                const droppedFile = e.dataTransfer.files?.[0];
+                if (droppedFile) {
+                  handleFileSelection(droppedFile);
+                }
+              }}
+            >
+              <div className="upload-dropzone-inner">
+                {file ? (
+                  <>
+                    <span className="upload-file-icon">📄</span>
+                    <strong className="upload-file-name">{file.name}</strong>
+                    <span className="upload-file-size">{formatFileSize(file.size)}</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="upload-icon">📥</span>
+                    <strong>拖入或选择合同文件</strong>
+                    <span className="upload-hint">支持 .docx 格式，最大 10MB，审查后可在线引用修改</span>
+                  </>
+                )}
               </div>
+            </div>
 
-              <form className="review-form review-form-inline" onSubmit={handleSubmit}>
+            <div className="upload-action-row">
+              {!file ? (
                 <button
-                  className={`file-drop ${file ? "file-drop-active" : ""}`}
+                  className="primary-button upload-submit-btn"
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  <span className="file-kicker">{file ? "已载入合同" : "选择合同文件"}</span>
-                  <strong>{file ? file.name : "拖入或选择 .docx 文件"}</strong>
-                  <small>{file ? formatFileSize(file.size) : `最大 ${maxFileSizeMb} MB，审查后可在线引用修改`}</small>
+                  选择合同并开始审查
                 </button>
-
-                <div className="button-row">
-                  <button className="primary-button" type="submit" disabled={!canSubmit}>
-                    {isLoading ? "审查中" : "开始审查"}
+              ) : (
+                <div className="upload-btn-group">
+                  <button
+                    className="primary-button upload-submit-btn"
+                    type="button"
+                    disabled={isLoading}
+                    onClick={() => void handleSubmit()}
+                  >
+                    {isLoading ? "正在生成审查结果…" : "上传并开始审查"}
                   </button>
-                  {(file || error) && !isLoading ? (
-                    <button className="secondary-button" type="button" onClick={clearReview}>
-                      清空
+                  {!isLoading && (
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => {
+                        setFile(null);
+                        setError(null);
+                        if (fileInputRef.current) {
+                          fileInputRef.current.value = "";
+                        }
+                      }}
+                    >
+                      重新选择
                     </button>
-                  ) : null}
+                  )}
                 </div>
-              </form>
+              )}
             </div>
-          ) : (
+
+            {isLoading && (
+              <div className="upload-progress-panel">
+                <div className="progress-bar" />
+                <p>正在解析合同、检索法规并生成审查意见…</p>
+              </div>
+            )}
+
+            {error && <p className="error-message upload-error">{error}</p>}
+
+            <div className="upload-status-footer">
+              <span className="status-dot"></span>
+              法规知识库已连接 · 审查模型 Qwen-Max
+            </div>
+          </div>
+        </div>
+      ) : (
+        <section className={`workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`} aria-busy={isLoading}>
+          <section className="reader-panel">
             <div className="compact-document-bar">
               <div className="document-info">
                 <span className="document-icon" aria-hidden="true">
@@ -755,6 +923,15 @@ export default function App() {
                 </div>
               </div>
               <div className="compact-document-actions">
+                {isSidebarCollapsed && (
+                  <button
+                    className="secondary-button compact-expand-btn"
+                    type="button"
+                    onClick={() => setIsSidebarCollapsed(false)}
+                  >
+                    展开结果
+                  </button>
+                )}
                 <button className="compact-reupload-btn" type="button" onClick={() => fileInputRef.current?.click()}>
                   重新上传
                 </button>
@@ -762,86 +939,84 @@ export default function App() {
                   清空
                 </button>
                 <button className="primary-button compact-review-btn" type="button" disabled={!canSubmit} onClick={(event) => void handleSubmit(event as never)}>
-                  {isLoading ? "审查中" : "重新审查"}
+                  {isLoading ? "正在生成审查结果…" : "重新审查"}
                 </button>
               </div>
             </div>
-          )}
-
-          {isLoading ? (
-            <div className="process-panel" role="status" aria-live="polite">
-              <div className="progress-bar" />
-              <p>正在解析合同、检索法规并调用百炼模型。</p>
-            </div>
-          ) : null}
-
-          {error ? <p className="error-message">{error}</p> : null}
-          {editorNotice ? <p className="success-message">{editorNotice}</p> : null}
-
-          <section className="editor-panel editor-panel-promoted" aria-label="合同正文编辑">
-            <div className="editor-heading">
-              <div>
-                <span className="section-label">Contract Draft</span>
-                <h2>合同正文</h2>
-                <p className="editor-subtitle">红线删除旧词，绿底高亮新增建议。占位符会以本地提示样式标记，方便复核。</p>
-              </div>
-              <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
-            </div>
-
-            {manualInsertRiskKey ? (
-              <div className="editor-mode-banner" role="status" aria-live="polite">
-                正在手动选择插入位置：点击正文中的目标段落，补充条款会插入到该段后面。
-              </div>
-            ) : null}
-
-            <div className={`editor-page editor-page-promoted${isSidebarCollapsed ? " editor-page-focus" : ""}`}>
-              <EditorContent editor={editor} />
-            </div>
-
-            <div className="export-row">
-              <div>
-                <strong>{modifications.length}</strong>
-                <span>条已接受修改</span>
-              </div>
-              <button className="primary-button" type="button" disabled={!canExport} onClick={handleExport}>
-                {isExporting ? "导出中" : "确认并导出修改版"}
-              </button>
-            </div>
-          </section>
-        </section>
-
-        <aside className={`review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
-          <section className="result-panel">
-            <div className="result-header">
-              <div>
-                <span className="section-label">Review Result</span>
-                <h2>{review?.filename ?? "等待合同上传"}</h2>
-                {review?.contract_type ? <p className="result-subtitle">合同类型：{review.contract_type}</p> : null}
-              </div>
-              <div className="score-summary" aria-label="风险统计">
-                <span className="score-high">高 {riskCounts.high}</span>
-                <span className="score-medium">中 {riskCounts.medium}</span>
-                <span className="score-low">低 {riskCounts.low}</span>
-              </div>
-            </div>
-
-            {!review && !isLoading ? (
-              <div className="empty-state">
-                <span className="empty-code">READY</span>
-                <p>选择一份合同后，审查结果会在这里生成。</p>
-                <small>点击风险卡时，正文区会定位到对应条款或锚点。</small>
-              </div>
-            ) : null}
 
             {isLoading ? (
-              <div className="loading-stack">
-                <div className="skeleton-line skeleton-title" />
-                <div className="skeleton-card" />
-                <div className="skeleton-card skeleton-card-short" />
+              <div className="process-panel" role="status" aria-live="polite">
+                <div className="progress-bar" />
+                <p>正在解析合同、检索法规并生成审查意见…</p>
               </div>
             ) : null}
 
-            {review ? (
+            {error ? <p className="error-message">{error}</p> : null}
+            {editorNotice ? <p className="success-message">{editorNotice}</p> : null}
+
+            <section className="editor-panel editor-panel-promoted" aria-label="合同正文编辑">
+              <div className="editor-heading">
+                <div>
+                  <h2>合同正文</h2>
+                  <p className="editor-subtitle">红线删除旧词，绿底高亮新增建议。占位符会以本地提示样式标记，方便复核。</p>
+                </div>
+                <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
+              </div>
+
+              {manualInsertRiskKey ? (
+                <div className="editor-mode-banner" role="status" aria-live="polite">
+                  正在手动选择插入位置：点击正文中的目标段落，补充条款会插入到该段后面。
+                </div>
+              ) : null}
+
+              <div className={`editor-page editor-page-promoted${isSidebarCollapsed ? " editor-page-focus" : ""}`}>
+                <EditorContent editor={editor} />
+              </div>
+
+              <div className="export-row">
+                <div>
+                  <strong>{modifications.length}</strong>
+                  <span>条已接受修改</span>
+                </div>
+                <button className="primary-button" type="button" disabled={!canExport} onClick={handleExport}>
+                  {isExporting ? "导出中" : "确认并导出修改版"}
+                </button>
+              </div>
+            </section>
+          </section>
+
+          <aside className={`review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
+            <section className="result-panel">
+              <div className="result-header">
+                <div className="result-header-title-row">
+                  <div>
+                    <h2>审查结果</h2>
+                    {review.contract_type ? <p className="result-subtitle">合同类型：{review.contract_type}</p> : null}
+                  </div>
+                  <button
+                    className="sidebar-collapse-btn"
+                    type="button"
+                    onClick={() => setIsSidebarCollapsed(true)}
+                    title="收起结果"
+                  >
+                    收起结果
+                  </button>
+                </div>
+                <div className="score-summary" aria-label="风险统计">
+                  <span className="score-high">高风险 {riskCounts.high}</span>
+                  <span className="score-medium">中风险 {riskCounts.medium}</span>
+                  <span className="score-low">低风险 {riskCounts.low}</span>
+                </div>
+              </div>
+
+              {isLoading ? (
+                <div className="loading-stack">
+                  <div className="skeleton-line skeleton-title" />
+                  <div className="skeleton-card" />
+                  <div className="skeleton-card skeleton-card-short" />
+                </div>
+              ) : null}
+
               <div className="result-stack" aria-live="polite">
                 <div className="summary-band">
                   <div>
@@ -926,7 +1101,7 @@ export default function App() {
                             </div>
                             <div className="risk-actions">
                               <button className="secondary-button inline-button" type="button" onClick={() => focusRisk(risk, riskKey)}>
-                                定位正文
+                                定位
                               </button>
                               <button
                                 className={`quote-button${isMissingClause(risk.original_text) ? " quote-append" : ""}`}
@@ -1014,10 +1189,10 @@ export default function App() {
                   )}
                 </div>
               </div>
-            ) : null}
-          </section>
-        </aside>
-      </section>
+            </section>
+          </aside>
+        </section>
+      )}
     </main>
   );
 }

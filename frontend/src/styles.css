@@ -1,24 +1,24 @@
 :root {
-  color: #17211c;
-  background: #eef2ef;
+  color: #1a231f;
+  background: #f8faf9;
   font-family:
     Aptos, "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     sans-serif;
-  --page: #eef2ef;
-  --surface: #fbfcfb;
-  --surface-muted: #f3f6f3;
-  --ink: #17211c;
-  --muted: #637067;
-  --line: #d9e1dc;
-  --line-strong: #bac7c0;
-  --accent: #145c3d;
-  --accent-soft: #e4f2eb;
+  --page: #f8faf9;
+  --surface: #ffffff;
+  --surface-muted: #f2f5f3;
+  --ink: #1a231f;
+  --muted: #5e6b62;
+  --line: #e2e8e4;
+  --line-strong: #cdd6d0;
+  --accent: #115e3b;
+  --accent-soft: #eef7f2;
   --danger: #b42318;
   --danger-soft: #fff1f0;
   --warn: #a15c07;
   --warn-soft: #fff7ed;
   --ok: #16714a;
-  --radius: 14px;
+  --radius: 12px;
 }
 
 * {
@@ -62,9 +62,26 @@ button:not(:disabled):active {
 .app-shell {
   min-height: 100dvh;
   padding: 22px;
-  background:
-    linear-gradient(135deg, rgb(20 92 61 / 7%), transparent 34%),
-    linear-gradient(180deg, #f8faf8 0%, var(--page) 58%);
+  background: var(--page);
+}
+
+.app-fallback {
+  width: min(680px, calc(100% - 40px));
+  margin: 14vh auto;
+  padding: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.app-fallback h1 {
+  margin: 8px 0 12px;
+}
+
+.app-fallback p:not(.eyebrow) {
+  margin: 0 0 24px;
+  color: var(--muted);
 }
 
 .topbar {
@@ -108,31 +125,80 @@ button:not(:disabled):active {
   letter-spacing: 0.04em;
 }
 
-.brand-block strong,
-.brand-block span {
-  display: block;
-}
-
 .brand-block strong {
   color: var(--ink);
   font-size: 0.92rem;
   line-height: 1.1;
 }
 
-.brand-block span,
-.system-strip {
+.brand-block span {
   color: var(--muted);
   font-size: 0.82rem;
 }
 
-.system-strip {
+/* System Status Dropdown */
+.system-status-container {
+  position: relative;
+}
+
+.system-status-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 8px 16px;
+  color: var(--ink);
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgb(0 0 0 / 2%);
+}
+
+.status-indicator-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: var(--ok);
+  box-shadow: 0 0 0 2px rgb(22 113 74 / 20%);
+}
+
+.system-status-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 50;
+  width: 240px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+  padding: 12px;
+  box-shadow: 0 10px 25px rgb(0 0 0 / 8%);
   display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex-direction: column;
   gap: 8px;
 }
 
-.system-strip span,
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.dropdown-label {
+  color: var(--muted);
+}
+
+.dropdown-value {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* Status Chip */
 .status-chip,
 .scope-panel span,
 .score-summary span {
@@ -145,7 +211,7 @@ button:not(:disabled):active {
 .workspace {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.9fr);
+  grid-template-columns: minmax(0, 65fr) minmax(320px, 35fr);
   gap: 22px;
   max-width: 1320px;
   margin: 0 auto;
@@ -161,7 +227,7 @@ button:not(:disabled):active {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: 0 18px 52px rgb(37 49 43 / 8%);
+  box-shadow: 0 8px 30px rgb(0 0 0 / 3%);
 }
 
 .reader-panel {
@@ -178,29 +244,6 @@ button:not(:disabled):active {
 
 .review-sidebar-collapsed {
   display: none;
-}
-
-.sidebar-toggle {
-  position: absolute;
-  top: 16px;
-  right: calc(minmax(360px, 0.9fr));
-  right: 0;
-  z-index: 3;
-  transform: translateX(50%);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #ffffff;
-  padding: 8px 12px;
-  color: var(--ink);
-  font-size: 0.8rem;
-  font-weight: 800;
-  cursor: pointer;
-  box-shadow: 0 10px 22px rgb(37 49 43 / 10%);
-}
-
-.sidebar-toggle-collapsed {
-  transform: none;
-  right: 10px;
 }
 
 .reader-header {
@@ -611,6 +654,7 @@ h1 {
   font-size: 0.82rem;
 }
 
+
 .scope-panel {
   border: 1px solid var(--line);
   background: #ffffff;
@@ -640,11 +684,50 @@ h1 {
 
 .result-header {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
   padding-bottom: 18px;
   border-bottom: 1px solid var(--line);
+}
+
+.result-header-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.sidebar-collapse-btn {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 6px 12px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.16s ease;
+}
+
+.sidebar-collapse-btn:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  background: var(--surface-muted);
+}
+
+.compact-expand-btn {
+  border: 1px solid var(--line-strong);
+  background: #ffffff;
+  padding: 6px 14px;
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 800;
+  cursor: pointer;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 .section-label {
@@ -1127,4 +1210,179 @@ h2 {
   .secondary-button {
     width: 100%;
   }
+}
+
+/* ==========================================================================
+   Upload View & Restructuring Styles
+   ========================================================================== */
+
+.upload-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100dvh - 128px);
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px 0;
+}
+
+.upload-header {
+  text-align: center;
+  margin-bottom: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.upload-header h1 {
+  font-size: 1.85rem;
+  font-weight: 780;
+  line-height: 1.25;
+  color: var(--ink);
+  margin: 0 auto;
+  text-wrap: balance;
+}
+
+.upload-header p {
+  color: var(--muted);
+  font-size: 0.94rem;
+  line-height: 1.5;
+}
+
+.upload-card {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 28px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 4%);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.upload-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  border: 2px dashed var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+  padding: 24px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: center;
+}
+
+.upload-dropzone:hover,
+.upload-dropzone-active {
+  border-color: var(--accent);
+  background-color: var(--accent-soft);
+}
+
+.upload-dropzone-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.upload-icon {
+  font-size: 2.2rem;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.upload-dropzone-inner strong {
+  font-size: 1.05rem;
+  color: var(--ink);
+}
+
+.upload-hint {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.upload-file-icon {
+  font-size: 2.8rem;
+  margin-bottom: 6px;
+}
+
+.upload-file-name {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--ink);
+  word-break: break-all;
+  max-width: 90%;
+}
+
+.upload-file-size {
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.upload-action-row {
+  display: flex;
+  flex-direction: column;
+}
+
+.upload-submit-btn {
+  width: 100%;
+  padding: 14px;
+  font-size: 1rem;
+}
+
+.upload-btn-group {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+}
+
+.upload-btn-group button {
+  flex: 1;
+}
+
+.upload-progress-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: var(--radius);
+  border: 1px solid rgb(20 92 61 / 12%);
+  background: var(--accent-soft);
+}
+
+.upload-progress-panel p {
+  color: var(--accent);
+  font-size: 0.86rem;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.upload-error {
+  margin: 0;
+  font-size: 0.86rem;
+}
+
+.upload-status-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  margin-top: 8px;
+}
+
+.upload-status-footer .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--ok);
 }

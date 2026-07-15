@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.schemas.review import ReviewResponse
 from app.services.docx_modifier import modify_docx_inplace, parse_modifications
@@ -63,7 +64,11 @@ async def review_contract(file: UploadFile = File(...)) -> ReviewResponse:
             detail="No readable text was found in the document.",
         )
 
-    review = review_contract_text(contract_text=contract_text, filename=file.filename)
+    review = await run_in_threadpool(
+        review_contract_text,
+        contract_text=contract_text,
+        filename=file.filename,
+    )
     review.contract_text = contract_text
     return review
 
@@ -94,7 +99,11 @@ async def export_reviewed_contract(
 
     try:
         parsed_modifications = parse_modifications(modifications)
-        reviewed_docx = modify_docx_inplace(file_bytes, parsed_modifications)
+        reviewed_docx = await run_in_threadpool(
+            modify_docx_inplace,
+            file_bytes,
+            parsed_modifications,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
