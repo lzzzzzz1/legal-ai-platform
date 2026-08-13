@@ -22,7 +22,19 @@ def test_health() -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
+    assert response.json()["api_version"] == "2026.08.13-deep-review"
+
+
+def test_system_status_does_not_expose_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "secret-value")
+    monkeypatch.setenv("BAILIAN_MODEL", "Qwen-Test")
+    monkeypatch.setenv("BAILIAN_BASE_URL", "http://model.internal/v1")
+    response = client.get("/api/system-status")
+
+    assert response.status_code == 200
+    assert response.json()["review_model"]["model"] == "Qwen-Test"
+    assert "secret-value" not in response.text
 
 
 def test_review_requires_docx() -> None:
@@ -67,3 +79,68 @@ def test_review_returns_structured_payload(monkeypatch) -> None:
     assert response.status_code == 200
     assert "合同份数" in response.json()["contract_text"]
     assert response.json()["risks"][0]["item"] == "合同份数"
+
+
+def test_review_rejects_empty_or_unknown_review_scope() -> None:
+    for scope in ("[]", '["未知范围"]', "{}"):
+        response = client.post(
+            "/api/review",
+            data={"review_scope": scope},
+            files={
+                "file": (
+                    "contract.docx",
+                    _build_docx_bytes(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        assert response.status_code == 400
+
+
+def test_review_accepts_selected_scope_and_forwards_it(monkeypatch) -> None:
+    captured = {}
+
+    def fake_review(contract_text: str, filename: str, selected_scope: list[str]) -> ReviewResponse:
+        captured["scope"] = selected_scope
+        return ReviewResponse(filename=filename, risks=[])
+
+    monkeypatch.setattr("app.main.review_contract_text", fake_review)
+    response = client.post(
+        "/api/review",
+        data={"review_scope": '["付款与发票"]'},
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["scope"] == ["付款与发票"]
+
+
+def test_text_review_accepts_preflight_corrected_text(monkeypatch) -> None:
+    captured = {}
+
+    def fake_review(contract_text: str, filename: str, selected_scope: list[str]) -> ReviewResponse:
+        captured.update({"text": contract_text, "filename": filename, "scope": selected_scope})
+        return ReviewResponse(filename=filename, risks=[], contract_text=contract_text)
+
+    monkeypatch.setattr("app.main.review_contract_text", fake_review)
+    response = client.post(
+        "/api/review/text",
+        json={
+            "filename": "contract.docx",
+            "contract_text": "第一条 服务范围，验收。",
+            "review_scope": ["付款与发票"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "text": "第一条 服务范围，验收。",
+        "filename": "contract.docx",
+        "scope": ["付款与发票"],
+    }

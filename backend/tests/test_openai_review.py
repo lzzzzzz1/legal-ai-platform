@@ -2,8 +2,278 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from app.schemas.review import ReviewCoverage, ReviewResponse, ReviewRisk
 from app.services import openai_review
 from app.services.openai_review import parse_review_response, review_contract_text
+from app.services.consistency_review import run_consistency_checks
+
+
+def test_consistency_checks_are_conservative_and_explainable() -> None:
+    checks = run_consistency_checks(
+        "甲方与乙方确认总价为人民币100元，另有附件。",
+        ["主体与签约权限", "标的与价格", "附件与文本一致性"],
+    )
+
+    by_name = {check.check: check for check in checks}
+    assert by_name["合同主体角色完整性"].status == "checked"
+    assert by_name["金额与总价一致性"].status == "checked"
+    assert by_name["附件引用一致性"].status == "warning"
+    assert by_name["附件引用一致性"].note
+
+
+def test_consistency_checks_flag_missing_operational_details() -> None:
+    checks = run_consistency_checks(
+        "甲方与乙方约定付款。合同自双方签署后生效。通知应以书面方式发出。争议由双方协商解决。",
+        ["付款与发票", "合同成立与效力", "通知与送达", "争议解决"],
+    )
+
+    by_name = {check.check: check for check in checks}
+    assert by_name["付款期限可执行性"].status == "warning"
+    assert by_name["生效日期可识别性"].status == "warning"
+    assert by_name["通知信息可送达性"].status == "warning"
+    assert by_name["争议解决路径明确性"].status == "warning"
+
+
+def test_consistency_checks_accept_operational_details() -> None:
+    checks = run_consistency_checks(
+        "合同于2026-08-12签订并生效。甲方应在收到发票后10个工作日付款。"
+        "通知送达邮箱为 legal@example.com。因本合同产生的争议提交上海仲裁委员会仲裁。",
+        ["付款与发票", "合同成立与效力", "通知与送达", "争议解决"],
+    )
+
+    by_name = {check.check: check for check in checks}
+    assert by_name["付款期限可执行性"].status == "checked"
+    assert by_name["生效日期可识别性"].status == "checked"
+    assert by_name["通知信息可送达性"].status == "checked"
+    assert by_name["争议解决路径明确性"].status == "checked"
+
+
+def test_parse_review_response_extracts_json_from_model_prose() -> None:
+    response = parse_review_response(
+        '我将以 JSON 返回结果：\n```json\n{"risks":[]}\n```',
+        filename="contract.docx",
+    )
+    assert response.risks == []
+
+
+def test_finalize_marks_unlocatable_model_quote_for_manual_review() -> None:
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="payment",
+                level="high",
+                original_text="text that is not in contract",
+                risk="risk",
+                suggestion="suggestion",
+            )
+        ],
+        review_summary="summary",
+    )
+
+    finalized = openai_review._finalize_review(review, "actual contract text", 10)
+
+    assert finalized.review_status == "partial"
+    assert any("原文定位" in warning for warning in finalized.warnings)
+
+
+def test_finalize_surfaces_model_rule_coverage_conflict() -> None:
+    topic = openai_review.RULE_TOPICS[0].name
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[],
+        review_summary="summary",
+        coverage=[ReviewCoverage(topic=topic, status="checked", evidence="model evidence")],
+    )
+
+    finalized = openai_review._finalize_review(review, "unrelated text", 10)
+
+    assert finalized.review_status == "partial"
+    assert any("模型审查与规则检查存在冲突" in warning for warning in finalized.warnings)
+
+
+def test_unmatched_law_citations_are_removed_from_usable_result() -> None:
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="payment",
+                level="high",
+                original_text="actual clause",
+                risk="risk",
+                suggestion="suggestion",
+                laws=["《不存在的法规》第1条", "《已核验法规》第1条"],
+            )
+        ],
+    )
+
+    checked = openai_review._validate_law_evidence(
+        review,
+        [{"label": "《已核验法规》第1条", "official_url": "https://official.example/law"}],
+    )
+
+    assert checked.risks[0].laws == ["《已核验法规》第1条"]
+    assert checked.risks[0].evidence_status == "needs_manual_review"
+    assert checked.risks[0].law_references[0].official_url == "https://official.example/law"
+
+
+def test_audit_redaction_masks_common_identifiers() -> None:
+    redacted = openai_review._redact_audit_text("a@b.com 13800138000 110101199001011234")
+    assert "a@b.com" not in redacted
+    assert "13800138000" not in redacted
+    assert "110101199001011234" not in redacted
+
+
+def test_large_contract_is_split_and_merged(monkeypatch) -> None:
+    monkeypatch.setattr(openai_review, "REVIEW_SEGMENT_CHARS", 1000)
+
+    def fake_segment(text: str, filename: str) -> ReviewResponse:
+        return ReviewResponse(
+            filename=filename,
+            contract_type="通用商务合同",
+            risks=[
+                ReviewRisk(
+                    item="付款条款",
+                    level="medium",
+                    original_text="同一风险",
+                    risk="风险",
+                    suggestion="建议",
+                    laws=["法条一"],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(openai_review, "_review_contract_segment", fake_segment)
+    contract_text = "第一段\n" + ("第二段内容\n" * 200) + "第三段"
+    response = review_contract_text(contract_text, "large.docx")
+
+    assert response.contract_text == contract_text
+    assert len(response.risks) >= 1
+    assert response.risks[0].laws == ["法条一"]
+    assert {item.topic for item in response.coverage} == set(openai_review.REVIEW_SCOPE)
+
+
+def test_segment_merge_deduplicates_same_contract_evidence(monkeypatch) -> None:
+    monkeypatch.setattr(openai_review, "_split_contract_text", lambda _: ["segment one", "segment two"])
+    calls = iter(["short suggestion", "a more complete suggestion"])
+
+    def fake_segment(text: str, filename: str) -> ReviewResponse:
+        return ReviewResponse(
+            filename=filename,
+            risks=[
+                ReviewRisk(
+                    item="payment",
+                    level="medium",
+                    original_text="same clause",
+                    risk="same risk",
+                    suggestion=next(calls),
+                    laws=["law"],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(openai_review, "_review_contract_segment", fake_segment)
+    response = review_contract_text("contract text", "dedupe.docx")
+
+    assert len([risk for risk in response.risks if risk.item == "payment"]) == 1
+    assert response.risks[0].suggestion == "a more complete suggestion"
+
+
+def test_empty_unexplained_model_response_retries_with_compact_schema(monkeypatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = '{"risks":[]}' if len(calls) == 1 else (
+                '{"contract_type":"通用商务合同","review_summary":"已复核所选范围，未形成可验证风险。","risks":[]}'
+            )
+            return type(
+                "FakeResponse",
+                (),
+                {"choices": [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]},
+            )()
+
+    class FakeOpenAI:
+        chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(openai_review, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(openai_review, "retrieve_relevant_laws", lambda _: [])
+
+    response = review_contract_text("合同仅约定项目名称。", "contract.docx")
+
+    assert len(calls) == 2
+    assert response.review_summary.startswith("已复核")
+    assert response.review_status == "partial"
+    assert response.risks
+    assert any(item.status == "missing" for item in response.coverage)
+
+
+def test_malformed_model_and_repair_response_fall_back_to_rules(monkeypatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return type(
+                "FakeResponse",
+                (),
+                {"choices": [type("Choice", (), {"message": type("Message", (), {"content": '{"risks":[{"检查项":"付款与发票","laws":[]}]}'})()})()]},
+            )()
+
+    class FakeOpenAI:
+        chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(openai_review, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(openai_review, "retrieve_relevant_laws", lambda _: [])
+
+    response = review_contract_text("合同只写了项目名称。", "contract.docx")
+
+    assert response.review_status == "partial"
+    assert response.risks
+    assert any("结构不完整" in warning for warning in response.warnings)
+
+
+def test_no_json_response_retries_original_contract_with_compact_schema(monkeypatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = "not json" if len(calls) == 1 else (
+                '{"contract_type":"通用商务合同","review_summary":"已完成复核",'
+                '"risks":[{"item":"付款与发票","level":"high",'
+                '"original_text":"【缺失该约定】","risk":"缺少付款安排",'
+                '"suggestion":"甲方应在验收后十日内付款。","laws":[]}]}'
+            )
+            return type(
+                "FakeResponse", (),
+                {"choices": [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]},
+            )()
+
+    class FakeOpenAI:
+        chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(openai_review, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(openai_review, "retrieve_relevant_laws", lambda _: [])
+
+    response = review_contract_text("甲方委托乙方提供服务。", "contract.docx", ["付款与发票"])
+
+    assert len(calls) == 2
+    assert response.review_summary == "已完成复核"
+    assert response.risks[0].item == "付款与发票"
+    assert "合同文本" in calls[1]["messages"][1]["content"]
+    assert "参考法条" not in calls[1]["messages"][1]["content"]
 
 
 def test_parse_review_response_accepts_risks_object() -> None:

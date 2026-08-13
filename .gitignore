@@ -9,6 +9,8 @@ dist/
 .vite/
 .npm-cache/
 *.tsbuildinfo
+*.log
 
 outputs/
 work/
+backend/logs/

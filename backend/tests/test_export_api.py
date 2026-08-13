@@ -33,6 +33,15 @@ def _build_english_docx_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _build_docx_with_same_header_text() -> bytes:
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = "合同份数：一式两份。"
+    document.add_paragraph("合同份数：一式两份。")
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def _read_docx_xml(docx_bytes: bytes, path: str) -> etree._Element:
     with ZipFile(BytesIO(docx_bytes), "r") as archive:
         return etree.fromstring(archive.read(path))
@@ -112,6 +121,137 @@ def test_export_fuzzy_matches_replacement_text() -> None:
 
     assert document_xml.find(".//w:ins", W_NS) is not None
     assert "合同份数：一式三份，甲乙双方各执一份，存档一份。" in "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+
+
+def test_final_export_contains_no_revision_markup() -> None:
+    modifications = [
+        {
+            "original": "合同份数：一式两份。",
+            "modified": "合同份数：一式四份，甲乙双方各执两份。",
+        }
+    ]
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(modifications, ensure_ascii=False),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == 'attachment; filename="final_contract.docx"'
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    settings_xml = _read_docx_xml(response.content, "word/settings.xml")
+    assert document_xml.find(".//w:ins", W_NS) is None
+    assert document_xml.find(".//w:del", W_NS) is None
+    assert settings_xml.find(".//w:trackRevisions", W_NS) is None
+    assert "合同份数：一式四份，甲乙双方各执两份。" in "".join(
+        document_xml.xpath(".//w:t/text()", namespaces=W_NS)
+    )
+
+
+def test_final_export_rejects_fuzzy_replacement_to_prevent_wrong_clause_edit() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{"original": "合同份数一式两份", "modified": "合同份数：一式三份。"}],
+                ensure_ascii=False,
+            ),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "could not be located exactly" in response.json()["detail"]
+
+
+def test_export_does_not_modify_same_text_in_header_or_footer() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_with_same_header_text(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{"original": "合同份数：一式两份。", "modified": "合同份数：一式四份。"}],
+                ensure_ascii=False,
+            ),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 200
+    header_xml = _read_docx_xml(response.content, "word/header1.xml")
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    assert "合同份数：一式两份。" in "".join(header_xml.xpath(".//w:t/text()", namespaces=W_NS))
+    assert "合同份数：一式四份。" in "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+
+
+def test_final_export_rejects_missing_clause_without_exact_anchor() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{"original": "【缺失该约定】", "modified": "新增通知条款。"}],
+                ensure_ascii=False,
+            ),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_export_rejects_conflicting_replacements_for_one_original() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [
+                    {"original": "合同份数：一式两份。", "modified": "合同份数：一式三份。"},
+                    {"original": "合同份数：一式两份。", "modified": "合同份数：一式四份。"},
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflicting" in response.json()["detail"]
 
 
 def test_export_inserts_missing_clause_after_anchor() -> None:
@@ -284,3 +424,23 @@ def test_export_rejects_invalid_modifications_json() -> None:
     )
 
     assert response.status_code == 400
+
+
+def test_review_feedback_is_recorded(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("REVIEW_FEEDBACK_LOG", str(tmp_path / "feedback.jsonl"))
+    response = client.post(
+        "/api/review/feedback",
+        json={
+            "filename": "contract.docx",
+            "risk_item": "付款与发票",
+            "decision": "rejected",
+            "note": "该条款已在附件中约定。",
+        },
+        headers={"X-Tenant-ID": "local"},
+    )
+
+    assert response.status_code == 201
+    record = json.loads((tmp_path / "feedback.jsonl").read_text(encoding="utf-8"))
+    assert record["decision"] == "rejected"
+    assert record["tenant_id"] == "local"
+    assert record["created_at"]

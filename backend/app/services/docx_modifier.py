@@ -10,6 +10,8 @@ from lxml import etree
 
 
 Modification = dict[str, Any]
+MAX_MODIFICATIONS = 200
+MAX_MODIFICATION_TEXT_CHARS = 20_000
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 W_P = f"{{{W_NS}}}p"
 W_R = f"{{{W_NS}}}r"
@@ -39,10 +41,22 @@ def parse_modifications(modifications_json: str) -> list[Modification]:
     payload = json.loads(modifications_json)
     if not isinstance(payload, list):
         raise ValueError("modifications must be a JSON array")
+    if not payload:
+        raise ValueError("at least one modification is required")
+    if len(payload) > MAX_MODIFICATIONS:
+        raise ValueError(f"at most {MAX_MODIFICATIONS} modifications are allowed")
 
+    seen_originals: dict[str, str] = {}
     for item in payload:
         if not isinstance(item, dict):
             raise ValueError("each modification must be an object")
+        original, modified = _modification_texts(item)
+        if len(original) > MAX_MODIFICATION_TEXT_CHARS or len(modified) > MAX_MODIFICATION_TEXT_CHARS:
+            raise ValueError("each modification text must be 20000 characters or shorter")
+        previous = seen_originals.get(original)
+        if previous is not None and previous != modified:
+            raise ValueError("the same original text cannot have conflicting replacements")
+        seen_originals[original] = modified
 
     return payload
 
@@ -82,9 +96,10 @@ def _is_missing_sentinel(text: str) -> bool:
 
 
 def _is_story_xml(path: str) -> bool:
-    return path == "word/document.xml" or (
-        path.endswith(".xml") and any(path.startswith(prefix) for prefix in XML_STORY_PREFIXES[1:])
-    )
+    # Contract edits are intentionally limited to the main document body.  A
+    # clause-like phrase in a header/footer is often branding, a page label or a
+    # legal notice; replacing it is both surprising and legally unsafe.
+    return path == "word/document.xml"
 
 
 def _paragraph_text(paragraph: etree._Element) -> str:
@@ -162,6 +177,27 @@ def _replace_paragraph_fully_with_revision(
 def _mark_inserted_paragraph(paragraph: etree._Element, modified: str, revision_id: int) -> None:
     _clear_paragraph_runs(paragraph)
     paragraph.append(_make_revision_container(W_INS, modified, revision_id))
+
+
+def _replace_with_final_text(paragraph: etree._Element, original: str, modified: str) -> bool:
+    """Replace one exact occurrence without adding Word revision markup."""
+    paragraph_text = _paragraph_text(paragraph)
+    exact_index = paragraph_text.find(original)
+    if exact_index < 0:
+        return False
+
+    prefix = paragraph_text[:exact_index]
+    suffix = paragraph_text[exact_index + len(original) :]
+    _clear_paragraph_runs(paragraph)
+    paragraph.append(_make_run(f"{prefix}{modified}{suffix}"))
+    return True
+
+
+def _replace_paragraph_fully_with_final_text(
+    paragraph: etree._Element, modified_text: str
+) -> None:
+    _clear_paragraph_runs(paragraph)
+    paragraph.append(_make_run(modified_text))
 
 
 def _disable_numbering(paragraph: etree._Element) -> None:
@@ -335,6 +371,47 @@ def _append_ooxml_paragraph(root: etree._Element, modified: str, revision_id: in
     return True
 
 
+def _insert_final_paragraph_after(root: etree._Element, anchor: str, modified: str) -> bool:
+    """Insert a plain paragraph after the selected anchor for a clean export."""
+    for paragraph in root.iter(W_P):
+        if anchor not in _paragraph_text(paragraph):
+            continue
+        clone = deepcopy(paragraph)
+        _clear_paragraph_runs(clone)
+        clone.append(_make_run(modified))
+        _disable_numbering(clone)
+        parent = paragraph.getparent()
+        if parent is None:
+            return False
+        parent.insert(parent.index(paragraph) + 1, clone)
+        return True
+
+    # A clean final contract must never insert after a merely similar clause.
+    # The user can choose an explicit anchor in the editor when no exact anchor
+    # is available; silently guessing here risks placing a clause in the wrong
+    # commercial section.
+    return False
+
+
+def _append_final_paragraph(root: etree._Element, modified: str) -> bool:
+    body = root.find(f".//{{{W_NS}}}body")
+    if body is None:
+        return False
+    clone = etree.Element(W_P)
+    _mark_plain_paragraph(clone, modified)
+    sect_pr = body.find(f"{{{W_NS}}}sectPr")
+    if sect_pr is None:
+        body.append(clone)
+    else:
+        body.insert(body.index(sect_pr), clone)
+    return True
+
+
+def _mark_plain_paragraph(paragraph: etree._Element, text: str) -> None:
+    _clear_paragraph_runs(paragraph)
+    paragraph.append(_make_run(text))
+
+
 def _ensure_track_revisions(settings_xml: bytes) -> bytes:
     parser = etree.XMLParser(remove_blank_text=False, recover=True)
     root = etree.fromstring(settings_xml, parser=parser)
@@ -343,11 +420,47 @@ def _ensure_track_revisions(settings_xml: bytes) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+def _remove_track_revisions(settings_xml: bytes) -> bytes:
+    parser = etree.XMLParser(remove_blank_text=False, recover=True)
+    root = etree.fromstring(settings_xml, parser=parser)
+    for node in root.findall(f".//{{{W_NS}}}trackRevisions"):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _accept_existing_revisions(root: etree._Element) -> None:
+    """Flatten revisions already present in an uploaded DOCX for final export."""
+    for deleted in list(root.iter(W_DEL)):
+        parent = deleted.getparent()
+        if parent is not None:
+            parent.remove(deleted)
+
+    for inserted in list(root.iter(W_INS)):
+        parent = inserted.getparent()
+        if parent is None:
+            continue
+        index = parent.index(inserted)
+        for child in list(inserted):
+            if child.tag == W_R:
+                for text_node in child.iter(W_DEL_TEXT):
+                    text_node.tag = W_T
+                parent.insert(index, child)
+                index += 1
+        parent.remove(inserted)
+
+
 def _modify_xml_story(
-    xml_bytes: bytes, modifications: list[tuple[str, str, str | None]], starting_revision_id: int
+    xml_bytes: bytes,
+    modifications: list[tuple[str, str, str | None]],
+    starting_revision_id: int,
+    track_revisions: bool = True,
 ) -> tuple[bytes, int, int]:
     parser = etree.XMLParser(remove_blank_text=False, recover=True)
     root = etree.fromstring(xml_bytes, parser=parser)
+    if not track_revisions:
+        _accept_existing_revisions(root)
     applied = 0
     revision_id = starting_revision_id
 
@@ -355,9 +468,15 @@ def _modify_xml_story(
         if _is_missing_sentinel(original):
             inserted = False
             if anchor:
-                inserted = _insert_after_ooxml_paragraph(root, anchor, modified, revision_id)
-            if not inserted:
-                inserted = _append_ooxml_paragraph(root, modified, revision_id)
+                inserted = (
+                    _insert_after_ooxml_paragraph(root, anchor, modified, revision_id)
+                    if track_revisions
+                    else _insert_final_paragraph_after(root, anchor, modified)
+                )
+            if not inserted and track_revisions:
+                inserted = (
+                    _append_ooxml_paragraph(root, modified, revision_id)
+                )
             applied += int(inserted)
             if inserted:
                 revision_id += 1
@@ -365,9 +484,19 @@ def _modify_xml_story(
 
         matched = False
         for paragraph in root.iter(W_P):
-            matched = _replace_ooxml_paragraph(paragraph, original, modified, revision_id) or matched
-        if not matched:
-            matched = _fuzzy_replace_ooxml_paragraph(root, original, modified, revision_id)
+            if original not in _paragraph_text(paragraph):
+                continue
+            if track_revisions:
+                matched = _replace_ooxml_paragraph(paragraph, original, modified, revision_id)
+            else:
+                matched = _replace_with_final_text(paragraph, original, modified)
+            # A modification represents one selected clause. Do not replace every
+            # paragraph that happens to contain the same text.
+            if matched:
+                break
+        if not matched and track_revisions:
+            if track_revisions:
+                matched = _fuzzy_replace_ooxml_paragraph(root, original, modified, revision_id)
         applied += int(matched)
         if matched:
             revision_id += 2
@@ -375,7 +504,11 @@ def _modify_xml_story(
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), applied, revision_id
 
 
-def modify_docx_inplace(file_bytes: bytes, modifications: list[Modification]) -> bytes:
+def modify_docx_inplace(
+    file_bytes: bytes,
+    modifications: list[Modification],
+    track_revisions: bool = True,
+) -> bytes:
     normalized_modifications = [
         (*_modification_texts(item), _modification_anchor(item)) for item in modifications
     ]
@@ -388,13 +521,23 @@ def modify_docx_inplace(file_bytes: bytes, modifications: list[Modification]) ->
             for item in source_docx.infolist():
                 data = source_docx.read(item.filename)
                 if _is_story_xml(item.filename):
-                    data, applied, revision_id = _modify_xml_story(data, normalized_modifications, revision_id)
+                    data, applied, revision_id = _modify_xml_story(
+                        data, normalized_modifications, revision_id, track_revisions=track_revisions
+                    )
                     total_applied += applied
                 elif item.filename == "word/settings.xml":
-                    data = _ensure_track_revisions(data)
+                    data = _ensure_track_revisions(data) if track_revisions else _remove_track_revisions(data)
                 target_docx.writestr(item, data)
 
     if normalized_modifications and total_applied == 0:
-        raise ValueError("No matching text or insertion anchor was found in the document.")
+        raise ValueError(
+            "One or more modifications could not be located exactly in the document. "
+            "Please re-locate the clause in the editor before exporting the final contract."
+        )
+    if total_applied < len(normalized_modifications):
+        raise ValueError(
+            "One or more modifications could not be located exactly in the document. "
+            "Please re-locate the clause in the editor before exporting the final contract."
+        )
 
     return output.getvalue()
