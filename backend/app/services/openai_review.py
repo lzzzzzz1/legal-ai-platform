@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +20,7 @@ from app.services.review_verifier import verify_high_risk_findings
 from app.services.consistency_review import run_consistency_checks
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 BAILIAN_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 BAILIAN_DEFAULT_MODEL = "qwen-max"
@@ -26,6 +28,11 @@ MAX_CONTRACT_CHARS = int(os.getenv("MAX_CONTRACT_CHARS", "40000"))
 REVIEW_SEGMENT_CHARS = int(os.getenv("REVIEW_SEGMENT_CHARS", "18000"))
 REVIEW_REPAIR_TIMEOUT_SECONDS = float(os.getenv("REVIEW_REPAIR_TIMEOUT_SECONDS", "20"))
 REVIEW_JSON_RETRY_MAX_CONTRACT_CHARS = int(os.getenv("REVIEW_JSON_RETRY_MAX_CONTRACT_CHARS", "12000"))
+# Keep automatic paragraph replacement within the same safe size boundary as
+# DOCX revision generation.  This module deliberately does not import the
+# modifier service, so that review-time quote repair has no document-export
+# side effects.
+MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS = int(os.getenv("MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS", "20000"))
 REVIEW_SCOPE = [PREFLIGHT_SCOPE, *(topic.name for topic in RULE_TOPICS)]
 SUPPORTED_CONTRACT_TYPES = {
     "采购/供应合同": "采购/供应合同",
@@ -39,6 +46,7 @@ SUPPORTED_CONTRACT_TYPES = {
     "通用商务合同": "通用商务合同",
     "通用合同": "通用商务合同",
 }
+PARAGRAPH_REFERENCE_PATTERN = re.compile(r"\[?\s*P(\d{1,5})\s*\]?", re.IGNORECASE)
 
 SYSTEM_PROMPT = (
     "你是一名资深企业法务律师，负责审阅企业间商业合同。"
@@ -100,6 +108,330 @@ def _trim_contract_text(contract_text: str) -> str:
         contract_text[:MAX_CONTRACT_CHARS]
         + "\n\n[合同文本过长，已截取前 60000 个字符用于本次 MVP 审查。]"
     )
+
+
+def format_contract_with_paragraph_references(contract_text: str) -> tuple[str, dict[str, str]]:
+    """Add stable, model-visible paragraph IDs without changing source text."""
+    references: dict[str, str] = {}
+    indexed_lines: list[str] = []
+    for line in contract_text.splitlines():
+        paragraph = line.strip()
+        if not paragraph:
+            continue
+        reference = f"P{len(references) + 1:03d}"
+        references[reference] = paragraph
+        indexed_lines.append(f"[{reference}] {paragraph}")
+    return "\n".join(indexed_lines) or contract_text, references
+
+
+def hydrate_review_clause_references(review: ReviewResponse, references: dict[str, str]) -> ReviewResponse:
+    """Attach an exact source-paragraph anchor for valid model paragraph IDs."""
+    resolved = 0
+    mismatched_quotes = 0
+    missing_marker = "【缺失该约定】"
+    for risk in review.risks:
+        reference_match = PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+        if not reference_match:
+            continue
+        reference = f"P{int(reference_match.group(1)):03d}"
+        paragraph = references.get(reference)
+        if not paragraph:
+            continue
+
+        original = risk.original_text.strip()
+        if original in {missing_marker, "缺失该约定"}:
+            if not risk.insert_after_text:
+                risk.insert_after_text = paragraph
+            resolved += 1
+            continue
+
+        # Keep a potentially paraphrased model quote untouched. The exact
+        # paragraph is only a safe locating anchor, never a fuzzy replacement.
+        risk.anchor_text = paragraph
+        resolved += 1
+        if original not in paragraph:
+            mismatched_quotes += 1
+
+    if resolved:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            f"已依据模型返回的段落编号补充 {resolved} 项原文定位锚点。",
+        ]))
+    if mismatched_quotes:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            f"有 {mismatched_quotes} 项模型引文与编号段落不完全一致，已提供原文段落供人工核对，不会自动改写。",
+        ]))
+    return review
+
+
+def _location_text(value: str) -> str:
+    """Normalize only layout whitespace for safe source-location comparison."""
+    return re.sub(r"\s+", "", value).strip()
+
+
+def bind_review_risks_to_unique_paragraphs(
+    review: ReviewResponse,
+    references: dict[str, str],
+) -> ReviewResponse:
+    """Bind unnumbered findings to one verified source paragraph when possible.
+
+    The first review pass occasionally omits ``clause_reference`` even though
+    it returned a verbatim quote.  Do not make the browser guess in that case:
+    resolve it against the backend's paragraph map, accepting only one exact
+    match (or a match differing solely in whitespace).  The original quote is
+    left untouched; the subsequent quote-repair pass verifies/replaces it.
+    """
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    resolved = 0
+    whitespace_resolved = 0
+
+    for risk in review.risks:
+        if risk.original_text.strip() in missing_markers:
+            continue
+        if PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip()):
+            continue
+
+        original = risk.original_text.strip()
+        anchor = (risk.anchor_text or "").strip()
+        candidates: list[tuple[str, str]] = []
+        if len(original) >= 8:
+            candidates = [(reference, paragraph) for reference, paragraph in references.items() if original in paragraph]
+
+        if len(candidates) != 1 and len(anchor) >= 8:
+            candidates = [(reference, paragraph) for reference, paragraph in references.items() if anchor in paragraph]
+
+        whitespace_only = False
+        if len(candidates) != 1:
+            normalized_original = _location_text(original)
+            normalized_anchor = _location_text(anchor)
+            if len(normalized_original) >= 8:
+                candidates = [
+                    (reference, paragraph)
+                    for reference, paragraph in references.items()
+                    if normalized_original in _location_text(paragraph)
+                ]
+                whitespace_only = len(candidates) == 1
+            if len(candidates) != 1 and len(normalized_anchor) >= 8:
+                candidates = [
+                    (reference, paragraph)
+                    for reference, paragraph in references.items()
+                    if normalized_anchor in _location_text(paragraph)
+                ]
+                whitespace_only = len(candidates) == 1
+
+        if len(candidates) == 1:
+            reference, paragraph = candidates[0]
+            risk.clause_reference = reference
+            risk.anchor_text = paragraph
+            resolved += 1
+            whitespace_resolved += int(whitespace_only)
+
+    if resolved:
+        warning = f"已按合同原文唯一匹配补充 {resolved} 项段落定位。"
+        if whitespace_resolved:
+            warning += f"其中 {whitespace_resolved} 项仅存在空格或换行差异，已按原文段落校验。"
+        review.warnings = list(dict.fromkeys([*review.warnings, warning]))
+    return review
+
+
+def recover_unreferenced_risk_locations(
+    client: OpenAI,
+    review: ReviewResponse,
+    references: dict[str, str],
+) -> ReviewResponse:
+    """Ask a narrow second-pass locator only for findings with no source ID.
+
+    Unlike a fuzzy client-side candidate list, this model pass must select one
+    paragraph ID from the immutable backend map.  The ID and returned quote are
+    validated before they are attached to a risk; a later repair pass turns a
+    valid ID into an exact quote or a whole verified source paragraph.
+    """
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    targets = [
+        {
+            "risk_index": index,
+            "item": risk.item,
+            "model_quote": risk.original_text,
+            "model_anchor": risk.anchor_text or "",
+            "risk": risk.risk,
+            "suggestion": risk.suggestion,
+        }
+        for index, risk in enumerate(review.risks)
+        if risk.original_text.strip() not in missing_markers
+        and not PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+    ]
+    if not targets:
+        return review
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a contract source locator. Return JSON only: "
+                        '{"matches":[{"risk_index":0,"clause_reference":"P001","original_text":""}]}. '
+                        "For every risk, select exactly one supplied P-number only when that paragraph directly contains "
+                        "the contractual term being reviewed. original_text must be a continuous character-for-character "
+                        "substring from that selected paragraph; return an empty clause_reference when no reliable paragraph exists."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"targets": targets, "contract_paragraphs": references}, ensure_ascii=False),
+                },
+            ],
+            temperature=0,
+            max_tokens=min(int(os.getenv("BAILIAN_LOCATION_RECOVERY_MAX_OUTPUT_TOKENS", "1600")), 2000),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **_json_mode_options(),
+        )
+        payload = _parse_json_content(response.choices[0].message.content or "")
+        matches = payload.get("matches", []) if isinstance(payload, dict) else []
+        recovered = 0
+        if isinstance(matches, list):
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
+                risk_index = match.get("risk_index")
+                reference_value = match.get("clause_reference")
+                quote = match.get("original_text")
+                if not isinstance(risk_index, int) or not isinstance(reference_value, str):
+                    continue
+                if not 0 <= risk_index < len(review.risks):
+                    continue
+                reference_match = PARAGRAPH_REFERENCE_PATTERN.fullmatch(reference_value.strip())
+                if not reference_match:
+                    continue
+                reference = f"P{int(reference_match.group(1)):03d}"
+                paragraph = references.get(reference)
+                if not paragraph:
+                    continue
+                risk = review.risks[risk_index]
+                risk.clause_reference = reference
+                risk.anchor_text = paragraph
+                if isinstance(quote, str) and len(quote.strip()) >= 8 and quote.strip() in paragraph:
+                    risk.original_text = quote.strip()
+                recovered += 1
+        if recovered:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"已通过二次原文定位为 {recovered} 项风险补充可验证段落编号。",
+            ]))
+    except Exception as exc:
+        logger.warning("Risk paragraph recovery skipped: %s", exc)
+    return review
+
+
+def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contract_text: str) -> ReviewResponse:
+    """Repair only model quotes that fail an exact source-text check.
+
+    This second pass is intentionally narrow: it receives the already located
+    source paragraph rather than the whole contract and may only return a
+    continuous, verbatim substring. The backend verifies the substring before
+    it can enable an automatic modification.
+    """
+    targets = []
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    for index, risk in enumerate(review.risks):
+        original = risk.original_text.strip()
+        anchor = (risk.anchor_text or "").strip()
+        if (
+            original in missing_markers
+            or original in contract_text
+            or not anchor
+            or anchor not in contract_text
+        ):
+            continue
+        has_paragraph_reference = bool(
+            PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+        )
+        targets.append({
+            "risk_index": index,
+            "model_quote": original,
+            "risk": risk.risk,
+            "source_paragraph": anchor,
+            "has_paragraph_reference": has_paragraph_reference,
+        })
+
+    if not targets:
+        return review
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an exact contract quote extractor. Return one JSON object only, with "
+                        '{"matches":[{"risk_index":0,"original_text":""}]}. '
+                        "For each item, original_text must be one continuous substring copied character-for-character "
+                        "from source_paragraph. Do not paraphrase, combine non-adjacent fragments, use ellipses, "
+                        "or return a clause number. Return an empty string if no reliable continuous quote exists."
+                    ),
+                },
+                {"role": "user", "content": json.dumps({"targets": targets}, ensure_ascii=False)},
+            ],
+            temperature=0,
+            max_tokens=min(int(os.getenv("BAILIAN_LOCATION_REPAIR_MAX_OUTPUT_TOKENS", "1200")), 1600),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **_json_mode_options(),
+        )
+        payload = _parse_json_content(response.choices[0].message.content or "")
+        matches = payload.get("matches", []) if isinstance(payload, dict) else []
+        repaired = 0
+        repaired_indexes: set[int] = set()
+        if isinstance(matches, list):
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
+                risk_index = match.get("risk_index")
+                quote = match.get("original_text")
+                if not isinstance(risk_index, int) or not isinstance(quote, str):
+                    continue
+                if not 0 <= risk_index < len(review.risks):
+                    continue
+                quote = quote.strip()
+                risk = review.risks[risk_index]
+                anchor = (risk.anchor_text or "").strip()
+                if len(quote) >= 8 and quote in anchor and quote in contract_text:
+                    risk.original_text = quote
+                    repaired += 1
+                    repaired_indexes.add(risk_index)
+        if repaired:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"已从候选合同段落逐字校验并修复 {repaired} 项定位引文。",
+            ]))
+        # A numbered paragraph is an exact source location supplied by the
+        # model against the backend's own contract index. If the model cannot
+        # isolate a smaller quote, use that verified paragraph as the source
+        # unit so the review can still be applied automatically and reversed
+        # independently. This is deliberately limited to P-number anchors;
+        # free-form headings and fuzzy candidates never take this path.
+        paragraph_replacements = 0
+        for target in targets:
+            risk_index = target["risk_index"]
+            if risk_index in repaired_indexes or not target["has_paragraph_reference"]:
+                continue
+            paragraph = target["source_paragraph"].strip()
+            if len(paragraph) < 16 or len(paragraph) > MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS:
+                continue
+            review.risks[risk_index].original_text = paragraph
+            paragraph_replacements += 1
+        if paragraph_replacements:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"有 {paragraph_replacements} 项引文未能缩小到短句，已按已核验的合同段落自动定位并整段修订；可在右侧单独撤销。",
+            ]))
+    except Exception as exc:
+        # Quote repair is an accuracy enhancement; a failure must never discard
+        # an otherwise valid review or weaken the existing manual-review gate.
+        logger.warning("Risk quote repair skipped: %s", exc)
+    return review
 
 
 def _infer_contract_language(contract_text: str) -> str:
@@ -621,6 +953,7 @@ def _review_contract_segment(
 
     law_context = format_laws_for_prompt(relevant_laws)
     contract_language = _infer_contract_language(contract_text)
+    indexed_contract, paragraph_references = format_contract_with_paragraph_references(contract_text)
 
     try:
         response = client.chat.completions.create(
@@ -638,6 +971,7 @@ def _review_contract_segment(
                         '"original_text":"合同原文中的精确原句或【缺失该约定】",'
                         '"anchor_text":"定位相关条款的邻近标题、条款号或相邻原句，可为null",'
                         '"insert_after_text":"新增条款应插入其后的合同原文锚点或null",'
+                        '"clause_reference":"P001 格式的合同段落编号",'
                         '"risk":"风险提示","suggestion":"修改建议",'
                         '"laws":["《法规名称》第XXX条"]}],'
                         '"review_summary":"基于合同原文的审查结论",'
@@ -646,6 +980,7 @@ def _review_contract_segment(
                         "contract_type 必须是四个固定值之一，不得自由发挥。"
                         "level 只能使用 high、medium、low。"
                         "original_text 必须逐字复制合同文本中的对应内容，标点、空格和换行必须保持一致。"
+                        "合同文本中每段前的 [P001] 是定位编号；非缺失风险必须返回对应 clause_reference，original_text 中不得包含编号。"
                         "anchor_text 应优先返回相关章节标题、条款号或邻近原句。"
                         "若 original_text 为【缺失该约定】，insert_after_text 必须优先选择合同中相关章节标题或相邻条款原文。"
                         "laws 必须列出本条建议引用的法规名称及条文号。"
@@ -657,7 +992,7 @@ def _review_contract_segment(
                         "若合同为中英混合，suggestion 必须跟随 original_text 或 insert_after_text 所在章节的语言。\n\n"
                         "法规引用约束：laws 只能从下方参考法条中原样选择，不能凭记忆补写法规名称或条文号；如果下方没有足够依据，laws 必须返回空数组，并在 review_summary 或 warnings 中说明需人工核验。\n"
                         f"参考法条：\n{law_context}\n\n"
-                        f"合同文本：\n{_trim_contract_text(contract_text)}"
+                        f"合同文本（段落编号仅用于定位）：\n{_trim_contract_text(indexed_contract)}"
                     ),
                 },
             ],
@@ -703,6 +1038,7 @@ def _review_contract_segment(
 
     try:
         parsed = parse_review_response(content=content, filename=filename)
+        parsed = hydrate_review_clause_references(parsed, paragraph_references)
         if _is_uninformative_model_response(parsed):
             raise ValueError("model returned an empty risks list without a review summary")
         if retrieval_warning:

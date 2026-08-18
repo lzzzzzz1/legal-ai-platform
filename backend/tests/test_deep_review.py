@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas.review import DeepReviewSettings, ReviewResponse
+from app.schemas.review import DeepReviewSettings, DocumentQuality, ReviewResponse
 from app.services import deep_review
 
 
@@ -17,7 +17,7 @@ def _deep_payload() -> dict:
                 "item": "付款与发票",
                 "level": "high",
                 "original_text": "甲方应在签约后支付全部费用。",
-                "clause_reference": "第 3 条",
+                "clause_reference": "P001",
                 "risk": "付款未与交付、验收和发票挂钩。",
                 "party_impact": "我方承担预付风险。",
                 "suggestion": "甲方应在验收合格并收到合法有效发票后 30 日内支付。",
@@ -45,6 +45,8 @@ def test_deep_review_parses_structured_model_result(monkeypatch) -> None:
         def create(self, **kwargs):
             assert "response_format" not in kwargs
             assert "party_a" in kwargs["messages"][1]["content"]
+            assert "付款与结果挂钩" in kwargs["messages"][1]["content"]
+            assert "[P001]" in kwargs["messages"][1]["content"]
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=deep_review.json.dumps(_deep_payload(), ensure_ascii=False)))])
 
     class FakeOpenAI:
@@ -56,13 +58,16 @@ def test_deep_review_parses_structured_model_result(monkeypatch) -> None:
     response = deep_review.review_contract_deeply(
         "甲方应在签约后支付全部费用。",
         "contract.docx",
-        DeepReviewSettings(party_role="party_a"),
+        DeepReviewSettings(party_role="party_a", deal_priorities=["预算可控，付款与结果挂钩"]),
     )
 
     assert response.deep_review is not None
     assert response.deep_review.state == "completed"
     assert response.risks[0].negotiation_level == "must_modify"
+    assert response.risks[0].anchor_text == "甲方应在签约后支付全部费用。"
     assert response.manual_review_required is True
+    assert [item.topic for item in response.coverage[:2]] == ["基础质量与合同框架", "深度商业与谈判审查"]
+    assert all(item.status == "checked" for item in response.coverage[:2])
 
 
 def test_deep_review_normalizes_string_coverage(monkeypatch) -> None:
@@ -85,7 +90,12 @@ def test_deep_review_normalizes_string_coverage(monkeypatch) -> None:
         DeepReviewSettings(party_role="party_a"),
     )
 
-    assert [item.topic for item in response.coverage] == ["价格与付款", "交付与验收"]
+    assert [item.topic for item in response.coverage] == [
+        "基础质量与合同框架",
+        "深度商业与谈判审查",
+        "价格与付款",
+        "交付与验收",
+    ]
     assert all(item.status == "checked" for item in response.coverage)
 
 
@@ -110,6 +120,35 @@ def test_deep_review_endpoint_forwards_settings(monkeypatch) -> None:
     assert response.status_code == 200
     assert captured["settings"].party_role == "party_a"
     assert response.json()["deep_review"]["overall_conclusion"] == "有条件可签"
+
+
+def test_deep_review_keeps_partial_document_quality(monkeypatch) -> None:
+    def fake_deep_review(contract_text: str, filename: str, settings: DeepReviewSettings) -> ReviewResponse:
+        return ReviewResponse(filename=filename, contract_text=contract_text, **_deep_payload())
+
+    monkeypatch.setattr("app.main.review_contract_deeply", fake_deep_review)
+    response = TestClient(app).post(
+        "/api/review/deep",
+        json={
+            "filename": "scan.pdf",
+            "contract_text": "可提取的合同文本",
+            "settings": {"party_role": "party_a"},
+            "document_quality": {
+                "kind": "pdf",
+                "status": "partial",
+                "pages": 4,
+                "extracted_chars": 1200,
+                "ocr_detected": False,
+                "note": "PDF 仅部分页面识别出文本，可能存在漏审，需要人工复核。",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["document_quality"]["status"] == "partial"
+    assert payload["manual_review_required"] is True
+    assert any("可能存在漏审" in warning for warning in payload["warnings"])
 
 
 def test_other_party_role_requires_description() -> None:

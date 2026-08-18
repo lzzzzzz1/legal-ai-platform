@@ -95,7 +95,45 @@ def test_export_returns_modified_docx() -> None:
     assert settings_xml.find(".//w:trackRevisions", W_NS) is not None
 
 
-def test_export_fuzzy_matches_replacement_text() -> None:
+def test_tracked_export_preserves_multiple_revisions_in_one_paragraph() -> None:
+    document = Document()
+    document.add_paragraph("付款应在签约后支付，验收标准由乙方确定。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [
+                    {"original": "签约后支付", "modified": "验收合格并收到发票后 30 日内支付"},
+                    {"original": "由乙方确定", "modified": "由甲方书面确认"},
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    assert len(document_xml.findall(".//w:ins", W_NS)) == 2
+    assert len(document_xml.findall(".//w:del", W_NS)) == 2
+    inserted_text = "".join(document_xml.xpath(".//w:ins//w:t/text()", namespaces=W_NS))
+    deleted_text = "".join(document_xml.xpath(".//w:del//w:delText/text()", namespaces=W_NS))
+    assert "验收合格并收到发票后 30 日内支付" in inserted_text
+    assert "由甲方书面确认" in inserted_text
+    assert "签约后支付" in deleted_text
+    assert "由乙方确定" in deleted_text
+
+
+def test_export_rejects_fuzzy_replacement_to_preserve_precise_location() -> None:
     modifications = [
         {
             "original": "合同份数一式两份",
@@ -115,12 +153,109 @@ def test_export_fuzzy_matches_replacement_text() -> None:
         data={"modifications": json.dumps(modifications, ensure_ascii=False)},
     )
 
+    assert response.status_code == 400
+    assert "could not be located exactly" in response.json()["detail"]
+
+
+def test_export_skips_unlocated_suggestion_when_other_revision_is_precise() -> None:
+    """Pending or stale suggestions cannot block an otherwise valid review export."""
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [
+                    {
+                        "original": "合同份数：一式两份。",
+                        "modified": "合同份数：一式四份，甲乙双方各执两份。",
+                    },
+                    {
+                        "original": "不存在的原文定位",
+                        "modified": "这条建议仍保留在审核页面，不能写入 Word。",
+                    },
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
     assert response.status_code == 200
-
+    assert response.headers["x-review-requested-modifications"] == "2"
+    assert response.headers["x-review-applied-modifications"] == "1"
+    assert response.headers["x-review-skipped-modifications"] == "1"
     document_xml = _read_docx_xml(response.content, "word/document.xml")
+    inserted_text = "".join(document_xml.xpath(".//w:ins//w:t/text()", namespaces=W_NS))
+    assert "合同份数：一式四份" in inserted_text
 
-    assert document_xml.find(".//w:ins", W_NS) is not None
-    assert "合同份数：一式三份，甲乙双方各执一份，存档一份。" in "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+
+def test_export_rejects_repeated_original_to_preserve_precise_location() -> None:
+    document = Document()
+    document.add_paragraph("付款应在验收后支付。")
+    document.add_paragraph("付款应在验收后支付。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{"original": "付款应在验收后支付。", "modified": "付款应在验收合格后 30 日内支付。"}],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "could not be located exactly" in response.json()["detail"]
+
+
+def test_export_allows_repeated_quote_after_user_confirms_its_paragraph() -> None:
+    document = Document()
+    document.add_paragraph("付款条件：付款应在验收后支付。")
+    document.add_paragraph("补充约定：付款应在验收后支付。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{
+                    "original": "付款应在验收后支付。",
+                    "modified": "付款应在验收合格后 30 日内支付。",
+                    "paragraph_context": "补充约定：付款应在验收后支付。",
+                }],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    inserted_text = "".join(document_xml.xpath(".//w:ins//w:t/text()", namespaces=W_NS))
+    deleted_text = "".join(document_xml.xpath(".//w:del//w:delText/text()", namespaces=W_NS))
+    assert inserted_text.count("付款应在验收合格后 30 日内支付。") == 1
+    assert deleted_text.count("付款应在验收后支付。") == 1
 
 
 def test_final_export_contains_no_revision_markup() -> None:
@@ -288,7 +423,7 @@ def test_export_inserts_missing_clause_after_anchor() -> None:
     assert document_xml.find(".//w:ins", W_NS) is not None
 
 
-def test_export_fuzzy_matches_insertion_anchor() -> None:
+def test_export_rejects_fuzzy_insertion_anchor_to_preserve_precise_location() -> None:
     response = client.post(
         "/api/export",
         files={
@@ -312,12 +447,8 @@ def test_export_fuzzy_matches_insertion_anchor() -> None:
         },
     )
 
-    assert response.status_code == 200
-
-    document_xml = _read_docx_xml(response.content, "word/document.xml")
-    paragraphs = _paragraph_texts_from_xml(document_xml)
-
-    assert "新增通知条款：双方应明确联系人与送达邮箱。" in paragraphs[1]
+    assert response.status_code == 400
+    assert "could not be located exactly" in response.json()["detail"]
 
 
 def test_export_appends_missing_clause_modification() -> None:
@@ -344,6 +475,34 @@ def test_export_appends_missing_clause_modification() -> None:
     paragraphs_text = "\n".join(_paragraph_texts_from_xml(document_xml))
 
     assert "新增条款：双方应明确通知联系人。" in paragraphs_text
+
+
+def test_export_allows_multiple_missing_clause_insertions() -> None:
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [
+                    {"original": "【缺失该约定】", "modified": "新增保密条款。", "insert_after_text": "合同份数：一式两份。"},
+                    {"original": "【缺失该约定】", "modified": "新增数据安全条款。", "insert_after_text": "签订地点：未约定。"},
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    inserted_text = "".join(document_xml.xpath(".//w:ins//w:t/text()", namespaces=W_NS))
+    assert "新增保密条款。" in inserted_text
+    assert "新增数据安全条款。" in inserted_text
 
 
 def test_export_matches_anchor_by_clause_heading() -> None:

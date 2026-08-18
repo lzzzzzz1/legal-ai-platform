@@ -4,7 +4,7 @@ from docx import Document
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas.review import ReviewResponse
+from app.schemas.review import ContractOverview, ReviewResponse
 
 
 client = TestClient(app)
@@ -44,6 +44,39 @@ def test_review_requires_docx() -> None:
     )
 
     assert response.status_code == 400
+
+
+def test_overview_returns_contract_orientation(monkeypatch) -> None:
+    def fake_create_contract_overview(contract_text: str) -> ContractOverview:
+        assert "合同份数" in contract_text
+        return ContractOverview(
+            contract_type="软件服务合同",
+            summary="甲方向乙方采购软件实施服务。",
+            parties=["甲方", "乙方"],
+            transaction_subject="软件实施服务",
+            key_terms=["服务范围待确认"],
+            clarification_questions=["请确认我方身份。"],
+            method="model",
+        )
+
+    monkeypatch.setattr("app.main.create_contract_overview", fake_create_contract_overview)
+    response = client.post(
+        "/api/overview",
+        files={
+            "file": (
+                "contract.docx",
+                _build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overview"]["contract_type"] == "软件服务合同"
+    assert payload["overview"]["parties"] == ["甲方", "乙方"]
+    assert payload["overview"]["method"] == "model"
+    assert "合同份数" in payload["contract_text"]
 
 
 def test_review_returns_structured_payload(monkeypatch) -> None:

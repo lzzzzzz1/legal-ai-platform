@@ -70,6 +70,53 @@ class DocumentQuality(BaseModel):
     note: str = ""
 
 
+class ContractOverviewDimension(BaseModel):
+    """Neutral, source-grounded facts for the pre-review contract portrait."""
+
+    category: str = Field(min_length=1, max_length=60)
+    status: Literal["stated", "partial", "not_found"] = "not_found"
+    details: list[str] = Field(default_factory=list, max_length=4)
+
+
+class ContractOverviewPartyResponsibility(BaseModel):
+    """Plain-language reading aid, not a legal conclusion."""
+
+    party: str = Field(min_length=1, max_length=100)
+    responsibilities: list[str] = Field(default_factory=list, max_length=5)
+
+
+class ContractOverviewDecisionPoint(BaseModel):
+    """Business question a user should answer before the later legal review."""
+
+    topic: str = Field(min_length=1, max_length=80)
+    contract_position: str = Field(default="", max_length=500)
+    user_question: str = Field(default="", max_length=300)
+
+
+class ContractOverview(BaseModel):
+    """A lightweight, non-legal orientation shown before the user sets a stance."""
+
+    contract_type: str = "通用商务合同"
+    summary: str = ""
+    parties: list[str] = Field(default_factory=list)
+    transaction_subject: str = ""
+    key_terms: list[str] = Field(default_factory=list)
+    dimensions: list[ContractOverviewDimension] = Field(default_factory=list, max_length=8)
+    business_flow: list[str] = Field(default_factory=list, max_length=6)
+    party_responsibilities: list[ContractOverviewPartyResponsibility] = Field(default_factory=list, max_length=4)
+    decision_points: list[ContractOverviewDecisionPoint] = Field(default_factory=list, max_length=5)
+    clarification_questions: list[str] = Field(default_factory=list)
+    method: Literal["model", "fallback"] = "fallback"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ContractOverviewResponse(BaseModel):
+    filename: str
+    contract_text: str
+    overview: ContractOverview
+    document_quality: DocumentQuality | None = None
+
+
 class DocumentPreflightCheck(BaseModel):
     """A lightweight, deterministic document-quality check.
 
@@ -102,12 +149,17 @@ class TextReviewRequest(BaseModel):
 class DeepReviewSettings(BaseModel):
     party_role: PartyRole
     other_party_role: str = Field(default="", max_length=200)
+    transaction_stage: str = Field(default="", max_length=100)
+    timeline_urgency: str = Field(default="", max_length=100)
+    counterparty_context: str = Field(default="", max_length=100)
+    deal_priorities: list[str] = Field(default_factory=list, max_length=6)
     focus_areas: list[str] = Field(default_factory=list, max_length=8)
     review_style: ReviewStyle = "protective"
     contract_type: str = Field(default="", max_length=100)
     special_requirements: list[str] = Field(default_factory=list, max_length=8)
     business_context: str = Field(default="", max_length=2_000)
     non_negotiables: str = Field(default="", max_length=2_000)
+    additional_notes: list[str] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="after")
     def require_other_role_description(self) -> "DeepReviewSettings":
@@ -120,6 +172,7 @@ class DeepReviewRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     contract_text: str = Field(min_length=1, max_length=400_000)
     settings: DeepReviewSettings
+    document_quality: DocumentQuality | None = None
 
 
 class DeepReviewKeyFact(BaseModel):

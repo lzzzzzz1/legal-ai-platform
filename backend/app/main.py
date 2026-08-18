@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.schemas.review import DeepReviewRequest, DocumentQuality, ReviewFeedback, ReviewResponse, TextReviewRequest
+from app.schemas.review import ContractOverviewResponse, DeepReviewRequest, DocumentQuality, ReviewFeedback, ReviewResponse, TextReviewRequest
 from app.services.docx_modifier import modify_docx_inplace, parse_modifications
 from app.services.docx_parser import extract_docx_text
 from app.services.pdf_parser import extract_pdf_document
@@ -21,6 +21,7 @@ from app.services.knowledge_import import (
 )
 from app.services.openai_review import review_contract_text
 from app.services.deep_review import review_contract_deeply
+from app.services.contract_overview import create_contract_overview
 from app.services.review_report import render_review_report
 from app.services.request_auth import require_request_identity
 
@@ -34,6 +35,11 @@ REVIEW_SCOPE_NAMES = {
     "主体与签约权限", "合同成立与效力", "标的与价格", "付款与发票", "交付与验收",
     "质量与售后", "违约与责任", "解除与终止", "知识产权", "保密与数据",
     "合规与许可", "通知与送达", "争议解决", "附件与文本一致性",
+}
+PDF_QUALITY_NOTES = {
+    "searchable": "PDF 文本可搜索，已完成文本提取。",
+    "partial": "PDF 仅部分页面识别出文本，可能存在漏审，需要人工复核。",
+    "scanned": "PDF 疑似扫描件，当前仅识别到少量文本，需要 OCR 后复核。",
 }
 
 app = FastAPI(
@@ -98,6 +104,47 @@ def _require_admin_token(x_admin_token: str | None) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin token.",
         )
+
+
+def _parse_contract_document(file_bytes: bytes, filename: str) -> tuple[str, DocumentQuality]:
+    """Parse an already size-validated contract consistently for every route."""
+    is_pdf = filename.lower().endswith(".pdf")
+    try:
+        if is_pdf:
+            parsed_pdf = extract_pdf_document(file_bytes, filename)
+            contract_text = parsed_pdf.text
+            quality = DocumentQuality(
+                kind="pdf",
+                status=parsed_pdf.status,
+                pages=parsed_pdf.pages,
+                extracted_chars=parsed_pdf.extracted_chars,
+                average_chars_per_page=parsed_pdf.average_chars_per_page,
+                ocr_detected=parsed_pdf.ocr_detected,
+                note=PDF_QUALITY_NOTES.get(
+                    parsed_pdf.status,
+                    "PDF 文本质量未知，审查结论需要人工复核。",
+                ),
+            )
+        else:
+            contract_text = extract_docx_text(file_bytes)
+            quality = DocumentQuality(
+                kind="docx",
+                status="not_applicable",
+                note="DOCX 使用原生文本解析。",
+            )
+    except Exception as exc:
+        suffix = Path(filename).suffix.lower() or "document"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to parse {suffix} file: {exc}",
+        ) from exc
+
+    if not contract_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No readable text was found in the document.",
+        )
+    return contract_text, quality
 
 
 @app.post("/api/admin/knowledge/snapshots", status_code=status.HTTP_201_CREATED)
@@ -168,42 +215,7 @@ async def review_contract(
             detail="Uploaded file must be 10 MB or smaller.",
         )
 
-    document_quality = DocumentQuality(
-        kind="pdf" if file.filename.lower().endswith(".pdf") else "docx",
-        status="not_applicable" if file.filename.lower().endswith(".docx") else "searchable",
-        note="DOCX 使用原生文本解析。" if file.filename.lower().endswith(".docx") else "",
-    )
-    try:
-        if file.filename.lower().endswith(".pdf"):
-            parsed_pdf = extract_pdf_document(file_bytes, file.filename)
-            contract_text = parsed_pdf.text
-            note = {
-                "searchable": "PDF 文本可搜索，已完成文本提取。",
-                "partial": "PDF 仅部分页面识别出文本，可能存在漏审，需人工复核。",
-                "scanned": "PDF 疑似扫描件，当前仅识别到少量文本，需先 OCR 后复核。",
-            }[parsed_pdf.status]
-            document_quality = DocumentQuality(
-                kind="pdf",
-                status=parsed_pdf.status,
-                pages=parsed_pdf.pages,
-                extracted_chars=parsed_pdf.extracted_chars,
-                average_chars_per_page=parsed_pdf.average_chars_per_page,
-                ocr_detected=parsed_pdf.ocr_detected,
-                note=note,
-            )
-        else:
-            contract_text = extract_docx_text(file_bytes)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to parse {Path(file.filename).suffix.lower()} file: {exc}",
-        ) from exc
-
-    if not contract_text:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No readable text was found in the document.",
-        )
+    contract_text, document_quality = _parse_contract_document(file_bytes, file.filename)
 
     selected_scope = None
     if review_scope:
@@ -239,12 +251,32 @@ async def review_contract(
     review = await run_in_threadpool(review_contract_text, **review_kwargs)
     review.contract_text = contract_text
     review.document_quality = document_quality
-    if document_quality.status == "partial":
+    if document_quality.status in {"partial", "scanned"}:
         review.warnings.append(document_quality.note)
         review.manual_review_required = True
         if review.review_status == "complete":
             review.review_status = "partial"
     return review
+
+
+@app.post("/api/overview", response_model=ContractOverviewResponse)
+async def contract_overview(
+    file: UploadFile = File(...),
+    x_api_token: str | None = Header(default=None),
+    x_tenant_id: str | None = Header(default=None),
+) -> ContractOverviewResponse:
+    """Parse the upload and return a neutral overview before review settings."""
+    require_request_identity(x_api_token, x_tenant_id)
+    if not file.filename or not file.filename.lower().endswith((".docx", ".pdf")):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .docx and .pdf files are supported.")
+    file_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not file_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Uploaded file must be 10 MB or smaller.")
+    contract_text, document_quality = _parse_contract_document(file_bytes, file.filename)
+    overview = await run_in_threadpool(create_contract_overview, contract_text)
+    return ContractOverviewResponse(filename=file.filename, contract_text=contract_text, overview=overview, document_quality=document_quality)
 
 
 @app.post("/api/review/text", response_model=ReviewResponse)
@@ -285,12 +317,22 @@ async def review_contract_deep_stage(
     x_tenant_id: str | None = Header(default=None),
 ) -> ReviewResponse:
     require_request_identity(x_api_token, x_tenant_id)
-    return await run_in_threadpool(
+    review = await run_in_threadpool(
         review_contract_deeply,
         contract_text=request.contract_text,
         filename=request.filename,
         settings=request.settings,
     )
+    review.document_quality = request.document_quality
+    if request.document_quality and request.document_quality.status in {"partial", "scanned"}:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            request.document_quality.note or "文档文本提取不完整，审查结论需要结合原件人工复核。",
+        ]))
+        review.manual_review_required = True
+        if review.review_status == "complete":
+            review.review_status = "partial"
+    return review
 
 
 @app.post("/api/export")
@@ -325,7 +367,7 @@ async def export_reviewed_contract(
         parsed_modifications = parse_modifications(modifications)
         if export_mode not in {"tracked", "final"}:
             raise ValueError("export_mode must be 'tracked' or 'final'.")
-        reviewed_docx = await run_in_threadpool(
+        export_result = await run_in_threadpool(
             modify_docx_inplace,
             file_bytes,
             parsed_modifications,
@@ -343,14 +385,17 @@ async def export_reviewed_contract(
         ) from exc
 
     return StreamingResponse(
-        iter([reviewed_docx]),
+        iter([export_result.content]),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
             "Content-Disposition": (
                 'attachment; filename="reviewed_contract.docx"'
                 if export_mode == "tracked"
                 else 'attachment; filename="final_contract.docx"'
-            )
+            ),
+            "X-Review-Requested-Modifications": str(export_result.requested),
+            "X-Review-Applied-Modifications": str(export_result.applied),
+            "X-Review-Skipped-Modifications": str(export_result.skipped),
         },
     )
 

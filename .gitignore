@@ -3,6 +3,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-*/
+**/.pytest-tmp/
 
 node_modules/
 dist/
@@ -14,3 +16,4 @@ dist/
 outputs/
 work/
 backend/logs/
+logs/

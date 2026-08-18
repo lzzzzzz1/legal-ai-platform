@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -122,6 +124,147 @@ def test_audit_redaction_masks_common_identifiers() -> None:
     assert "a@b.com" not in redacted
     assert "13800138000" not in redacted
     assert "110101199001011234" not in redacted
+
+
+def test_paragraph_reference_recovers_an_exact_source_anchor() -> None:
+    contract_text = "第一条 付款安排。\n甲方应在验收后付款。"
+    indexed_text, references = openai_review.format_contract_with_paragraph_references(contract_text)
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="付款",
+                level="medium",
+                original_text="甲方应在验收后付款。",
+                clause_reference="P002",
+                risk="付款条件需核对。",
+                suggestion="甲方应在验收合格并收到发票后付款。",
+            )
+        ],
+    )
+
+    hydrated = openai_review.hydrate_review_clause_references(review, references)
+
+    assert "[P001]" in indexed_text
+    assert hydrated.risks[0].anchor_text == "甲方应在验收后付款。"
+    assert any("段落编号" in warning for warning in hydrated.warnings)
+
+
+def test_quote_repair_only_accepts_verbatim_text_from_the_source_paragraph(monkeypatch) -> None:
+    contract_text = "乙方仅赔偿直接损失，不承担间接损失。"
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="责任限制",
+                level="high",
+                original_text="乙方不承担全部损失",
+                anchor_text=contract_text,
+                risk="责任限制过宽。",
+                suggestion="乙方应赔偿全部损失。",
+            )
+        ],
+    )
+
+    class FakeCompletions:
+        def create(self, **_: object):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"original_text":"乙方仅赔偿直接损失"}]}'))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    repaired = openai_review.repair_unlocatable_risk_quotes(fake_client, review, contract_text)
+
+    assert repaired.risks[0].original_text == "乙方仅赔偿直接损失"
+    assert any("逐字校验" in warning for warning in repaired.warnings)
+
+
+def test_quote_repair_uses_verified_paragraph_when_short_quote_cannot_be_extracted() -> None:
+    contract_text = "因非乙方原因造成的数据遗失、数据污染，乙方不承担任何责任。"
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="责任限制",
+                level="high",
+                original_text="乙方不承担全部损失",
+                anchor_text=contract_text,
+                clause_reference="P001",
+                risk="责任限制过宽。",
+                suggestion="乙方仅在存在过错时承担经证明的直接损失。",
+            )
+        ],
+    )
+
+    class FakeCompletions:
+        def create(self, **_: object):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[]}'))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    repaired = openai_review.repair_unlocatable_risk_quotes(fake_client, review, contract_text)
+
+    assert repaired.risks[0].original_text == contract_text
+    assert any("整段修订" in warning for warning in repaired.warnings)
+
+
+def test_unreferenced_risk_is_bound_by_a_unique_contract_quote() -> None:
+    paragraph = "乙方应在验收合格后十个工作日内提供合法有效的增值税专用发票。"
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="发票",
+                level="medium",
+                original_text="验收合格后十个工作日内提供合法有效的增值税专用发票",
+                risk="开票义务需要明确。",
+                suggestion="乙方应在验收合格后十个工作日内提供合法有效的增值税专用发票。",
+            )
+        ],
+    )
+
+    bound = openai_review.bind_review_risks_to_unique_paragraphs(
+        review,
+        {"P001": "合同标题", "P002": paragraph},
+    )
+
+    assert bound.risks[0].clause_reference == "P002"
+    assert bound.risks[0].anchor_text == paragraph
+    assert any("唯一匹配" in warning for warning in bound.warnings)
+
+
+def test_second_pass_recovers_paragraph_id_and_verbatim_quote() -> None:
+    paragraph = "乙方仅赔偿直接损失，不承担间接损失。"
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="责任限制",
+                level="high",
+                original_text="乙方责任过轻",
+                risk="责任限制过宽。",
+                suggestion="乙方应赔偿经证明的直接损失。",
+            )
+        ],
+    )
+
+    class FakeCompletions:
+        def create(self, **_: object):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"clause_reference":"P003","original_text":"乙方仅赔偿直接损失"}]}'))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    recovered = openai_review.recover_unreferenced_risk_locations(
+        fake_client,
+        review,
+        {"P003": paragraph},
+    )
+
+    assert recovered.risks[0].clause_reference == "P003"
+    assert recovered.risks[0].anchor_text == paragraph
+    assert recovered.risks[0].original_text == "乙方仅赔偿直接损失"
 
 
 def test_large_contract_is_split_and_merged(monkeypatch) -> None:
