@@ -10,7 +10,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.schemas.review import ContractOverviewResponse, DeepReviewRequest, DocumentQuality, ReviewFeedback, ReviewResponse, TextReviewRequest
+from app.schemas.review import (
+    ContractOverviewResponse,
+    DeepReviewRequest,
+    DocumentQuality,
+    IntakeChatRequest,
+    IntakeChatResponse,
+    ReviewFeedback,
+    ReviewResponse,
+    TextReviewRequest,
+)
 from app.services.docx_modifier import modify_docx_inplace, parse_modifications
 from app.services.docx_parser import extract_docx_text
 from app.services.pdf_parser import extract_pdf_document
@@ -22,11 +31,12 @@ from app.services.knowledge_import import (
 from app.services.openai_review import review_contract_text
 from app.services.deep_review import review_contract_deeply
 from app.services.contract_overview import create_contract_overview
+from app.services.intake_chat import continue_intake_chat
 from app.services.review_report import render_review_report
 from app.services.request_auth import require_request_identity
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-API_VERSION = "2026.08.13-deep-review"
+API_VERSION = "2026.08.18-chat-intake"
 MAX_KNOWLEDGE_SNAPSHOT_BYTES = int(
     os.getenv("MAX_KNOWLEDGE_SNAPSHOT_BYTES", str(250 * 1024 * 1024))
 )
@@ -277,6 +287,17 @@ async def contract_overview(
     contract_text, document_quality = _parse_contract_document(file_bytes, file.filename)
     overview = await run_in_threadpool(create_contract_overview, contract_text)
     return ContractOverviewResponse(filename=file.filename, contract_text=contract_text, overview=overview, document_quality=document_quality)
+
+
+@app.post("/api/intake/chat", response_model=IntakeChatResponse)
+async def continue_intake_conversation(
+    request: IntakeChatRequest,
+    x_api_token: str | None = Header(default=None),
+    x_tenant_id: str | None = Header(default=None),
+) -> IntakeChatResponse:
+    """Turn a free-form pre-review chat into later deep-review settings."""
+    require_request_identity(x_api_token, x_tenant_id)
+    return await run_in_threadpool(continue_intake_chat, request)
 
 
 @app.post("/api/review/text", response_model=ReviewResponse)

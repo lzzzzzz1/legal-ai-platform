@@ -17,3 +17,4 @@ outputs/
 work/
 backend/logs/
 logs/
+.pytest-runtime/

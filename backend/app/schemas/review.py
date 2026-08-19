@@ -117,6 +117,42 @@ class ContractOverviewResponse(BaseModel):
     document_quality: DocumentQuality | None = None
 
 
+class IntakeChatMessage(BaseModel):
+    """One turn in the pre-review business-intake conversation."""
+
+    role: Literal["assistant", "user"]
+    content: str = Field(min_length=1, max_length=2_000)
+
+
+class IntakeReviewCriteria(BaseModel):
+    """User-confirmed preferences extracted from conversation, not contract facts."""
+
+    party_role: PartyRole | None = None
+    other_party_role: str = Field(default="", max_length=200)
+    deal_priorities: list[str] = Field(default_factory=list, max_length=6)
+    focus_areas: list[str] = Field(default_factory=list, max_length=8)
+    review_style: ReviewStyle = "protective"
+    business_context: str = Field(default="", max_length=2_000)
+    non_negotiables: str = Field(default="", max_length=2_000)
+    special_requirements: list[str] = Field(default_factory=list, max_length=8)
+    additional_notes: list[str] = Field(default_factory=list, max_length=5)
+
+
+class IntakeChatRequest(BaseModel):
+    contract_text: str = Field(min_length=1, max_length=400_000)
+    overview: ContractOverview
+    messages: list[IntakeChatMessage] = Field(default_factory=list, max_length=12)
+    criteria: IntakeReviewCriteria = Field(default_factory=IntakeReviewCriteria)
+
+
+class IntakeChatResponse(BaseModel):
+    assistant_message: str = Field(min_length=1, max_length=2_000)
+    criteria: IntakeReviewCriteria = Field(default_factory=IntakeReviewCriteria)
+    ready_for_review: bool = False
+    source: Literal["model", "fallback"] = "fallback"
+    warning: str | None = None
+
+
 class DocumentPreflightCheck(BaseModel):
     """A lightweight, deterministic document-quality check.
 

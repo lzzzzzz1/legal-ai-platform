@@ -4,7 +4,7 @@ from docx import Document
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas.review import ContractOverview, ReviewResponse
+from app.schemas.review import ContractOverview, IntakeChatResponse, ReviewResponse
 
 
 client = TestClient(app)
@@ -23,7 +23,7 @@ def test_health() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["api_version"] == "2026.08.13-deep-review"
+    assert response.json()["api_version"] == "2026.08.18-chat-intake"
 
 
 def test_system_status_does_not_expose_credentials(monkeypatch) -> None:
@@ -77,6 +77,33 @@ def test_overview_returns_contract_orientation(monkeypatch) -> None:
     assert payload["overview"]["parties"] == ["甲方", "乙方"]
     assert payload["overview"]["method"] == "model"
     assert "合同份数" in payload["contract_text"]
+
+
+def test_intake_chat_returns_modelled_review_criteria(monkeypatch) -> None:
+    def fake_continue(request):
+        assert request.overview.contract_type == "软件服务合同"
+        assert "甲方" in request.contract_text
+        return IntakeChatResponse(
+            assistant_message="请说明本次交易最想达成的业务结果。",
+            criteria={"party_role": "party_a", "business_context": "采购方希望按期上线"},
+            ready_for_review=True,
+            source="model",
+        )
+
+    monkeypatch.setattr("app.main.continue_intake_chat", fake_continue)
+    response = client.post(
+        "/api/intake/chat",
+        json={
+            "contract_text": "甲方采购乙方软件服务。",
+            "overview": {"contract_type": "软件服务合同", "summary": "甲方采购服务。"},
+            "messages": [{"role": "user", "content": "我是甲方采购方。"}],
+            "criteria": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["criteria"]["party_role"] == "party_a"
+    assert response.json()["source"] == "model"
 
 
 def test_review_returns_structured_payload(monkeypatch) -> None:

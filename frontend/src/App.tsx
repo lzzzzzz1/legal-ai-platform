@@ -126,6 +126,31 @@ type ContractOverviewResponse = {
   document_quality?: DocumentQuality | null;
 };
 
+type IntakeChatMessage = {
+  role: "assistant" | "user";
+  content: string;
+};
+
+type IntakeReviewCriteria = {
+  party_role: PartyRole | null;
+  other_party_role: string;
+  deal_priorities: string[];
+  focus_areas: string[];
+  review_style: ReviewStyle;
+  business_context: string;
+  non_negotiables: string;
+  special_requirements: string[];
+  additional_notes: string[];
+};
+
+type IntakeChatResponse = {
+  assistant_message: string;
+  criteria: IntakeReviewCriteria;
+  ready_for_review: boolean;
+  source: "model" | "fallback";
+  warning?: string | null;
+};
+
 type ReviewResponse = {
   filename: string;
   contract_type?: string | null;
@@ -156,6 +181,7 @@ type SystemStatus = {
 
 type Modification = {
   item?: string;
+  risk_key?: string;
   original: string;
   modified: string;
   revision_id?: string;
@@ -190,11 +216,43 @@ type RiskLocationCandidate = {
 };
 
 type ReviewStage = "upload" | "intake" | "modification";
+// Retained while older intake helpers remain available for saved local state;
+// the visible workflow is now driven by IntakeChatMessage instead.
 type IntakeConversationStep = "role" | "objective" | "focus" | "redlines" | "ready";
 
 type DeepReviewFormSettings = Omit<DeepReviewSettings, "party_role"> & {
   party_role: PartyRole | "";
 };
+
+const emptyIntakeCriteria: IntakeReviewCriteria = {
+  party_role: null,
+  other_party_role: "",
+  deal_priorities: [],
+  focus_areas: [],
+  review_style: "protective",
+  business_context: "",
+  non_negotiables: "",
+  special_requirements: [],
+  additional_notes: []
+};
+
+function criteriaToDeepReviewSettings(criteria: IntakeReviewCriteria, overview: ContractOverview): DeepReviewFormSettings {
+  return {
+    party_role: criteria.party_role ?? "",
+    other_party_role: criteria.other_party_role,
+    transaction_stage: "",
+    timeline_urgency: "",
+    counterparty_context: "",
+    deal_priorities: criteria.deal_priorities,
+    focus_areas: criteria.focus_areas,
+    review_style: criteria.review_style,
+    contract_type: overview.contract_type,
+    special_requirements: criteria.special_requirements,
+    business_context: criteria.business_context,
+    non_negotiables: criteria.non_negotiables,
+    additional_notes: criteria.additional_notes
+  };
+}
 
 const DeleteMark = Mark.create({
   name: "deleted",
@@ -341,6 +399,14 @@ function getIntakeRecommendations(overview: ContractOverview) {
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
     const normalizedMessage = error.message.toLowerCase();
+
+    if (
+      normalizedMessage === "failed to fetch"
+      || normalizedMessage.includes("networkerror")
+      || normalizedMessage.includes("network request failed")
+    ) {
+      return "无法连接本地后端服务。请确认 http://127.0.0.1:8000/health 可正常访问后重试。";
+    }
 
     if (error.message === "Not Found") {
       return "导出接口暂未在运行中的后端生效，请重启或重建后端服务后再试。";
@@ -548,20 +614,29 @@ function applyPreciselyLocatedChanges(
   const htmlParagraphs = getHtmlParagraphs(textToEditorHtml(sourceText));
   const modifications: Modification[] = [];
   const appliedItems: string[] = [];
-  const touchedParagraphs = new Set<number>();
   const proposed = [
     ...checks
       .filter((check) => check.auto_fixable && check.original_text && check.replacement_text)
-      .map((check) => ({
+      .map((check, index) => ({
         item: `基础修正：${check.title}`,
+        riskKey: `preflight-${check.category}-${check.title}-${index}`,
         original: check.original_text!,
         modified: check.replacement_text!,
         source: "preflight" as const,
       })),
     ...risks
       .filter((risk) => !isMissingClause(risk.original_text) && Boolean(risk.original_text.trim()) && Boolean(risk.suggestion.trim()))
-      .map((risk) => ({ item: risk.item, original: risk.original_text, modified: risk.suggestion, source: "risk" as const, risk })),
+      .map((risk) => ({
+        item: risk.item,
+        riskKey: getRiskKey(risk),
+        original: risk.original_text,
+        modified: risk.suggestion,
+        source: "risk" as const,
+        risk,
+      })),
   ];
+
+  const plannedByParagraph = new Map<number, Array<typeof proposed[number] & { index: number }>>();
 
   for (const change of proposed) {
     const matches: Array<{ paragraphIndex: number; index: number }> = [];
@@ -590,25 +665,48 @@ function applyPreciselyLocatedChanges(
         }
       }
     }
-    // Conflicting changes to the same paragraph remain pending so no prior
-    // revision mark is overwritten by another automatic proposal.
-    if (!match || touchedParagraphs.has(match.paragraphIndex)) continue;
-    const originalParagraph = paragraphs[match.paragraphIndex];
-    const revisionId = `auto-${match.paragraphIndex}-${modifications.length + 1}`;
-    const nextParagraph = originalParagraph.slice(0, match.index) + change.modified + originalParagraph.slice(match.index + change.original.length);
-    paragraphs[match.paragraphIndex] = nextParagraph;
-    htmlParagraphs[match.paragraphIndex] = buildReplacementDiffHtml(originalParagraph, change.original, change.modified, match.index, revisionId);
-    touchedParagraphs.add(match.paragraphIndex);
-    modifications.push({
-      item: change.item,
-      original: change.original,
-      modified: change.modified,
-      revision_id: revisionId,
-      paragraph_context: originalParagraph,
-      anchor_text: change.source === "risk" ? change.risk?.anchor_text ?? null : null,
-      insert_after_text: change.source === "risk" ? change.risk?.insert_after_text ?? null : null,
-    });
-    if (change.source === "risk") appliedItems.push(change.item);
+    if (!match) continue;
+    const planned = plannedByParagraph.get(match.paragraphIndex) ?? [];
+    planned.push({ ...change, index: match.index });
+    plannedByParagraph.set(match.paragraphIndex, planned);
+  }
+
+  for (const [paragraphIndex, changes] of plannedByParagraph) {
+    const originalParagraph = paragraphs[paragraphIndex];
+    const accepted = [] as Array<typeof changes[number] & { revisionId: string }>;
+    let occupiedUntil = -1;
+    for (const change of [...changes].sort((left, right) => left.index - right.index || left.original.length - right.original.length)) {
+      const end = change.index + change.original.length;
+      if (change.index < occupiedUntil) continue;
+      accepted.push({ ...change, revisionId: `auto-${paragraphIndex}-${modifications.length + accepted.length + 1}` });
+      occupiedUntil = end;
+    }
+    if (!accepted.length) continue;
+
+    let textCursor = 0;
+    let correctedParagraph = "";
+    let revisionHtml = "<p>";
+    for (const change of accepted) {
+      const prefix = originalParagraph.slice(textCursor, change.index);
+      correctedParagraph += prefix + change.modified;
+      revisionHtml += `${renderPlainTextFragment(prefix)}<del class="del-mark" data-revision-id="${escapeHtml(change.revisionId)}">${renderPlainTextFragment(change.original)}</del><ins class="ins-mark" data-revision-id="${escapeHtml(change.revisionId)}">${renderPlainTextFragment(change.modified)}</ins>`;
+      textCursor = change.index + change.original.length;
+      modifications.push({
+        item: change.item,
+        risk_key: change.riskKey,
+        original: change.original,
+        modified: change.modified,
+        revision_id: change.revisionId,
+        paragraph_context: originalParagraph,
+        anchor_text: change.source === "risk" ? change.risk?.anchor_text ?? null : null,
+        insert_after_text: change.source === "risk" ? change.risk?.insert_after_text ?? null : null,
+      });
+      if (change.source === "risk") appliedItems.push(change.item);
+    }
+    correctedParagraph += originalParagraph.slice(textCursor);
+    revisionHtml += `${renderPlainTextFragment(originalParagraph.slice(textCursor))}</p>`;
+    paragraphs[paragraphIndex] = correctedParagraph;
+    htmlParagraphs[paragraphIndex] = revisionHtml;
   }
 
   return { correctedText: paragraphs.join("\n"), revisionHtml: htmlParagraphs.join(""), modifications, appliedItems };
@@ -685,8 +783,17 @@ function findRiskLocationCandidates(text: string, risk: ReviewRisk): RiskLocatio
     .slice(0, 4);
 }
 
-function getRiskKey(risk: ReviewRisk, index: number) {
-  return `${risk.item}-${risk.original_text}-${index}`;
+function getRiskKey(risk: ReviewRisk) {
+  return `${risk.item}\u0000${risk.original_text}\u0000${risk.suggestion}`;
+}
+
+function isRiskModification(modification: Modification, risk: ReviewRisk, riskKey: string) {
+  if (modification.risk_key) {
+    return modification.risk_key === riskKey;
+  }
+  return modification.item === risk.item
+    && (modification.original === risk.original_text
+      || (isMissingClause(risk.original_text) && modification.modified === risk.suggestion));
 }
 
 function getParagraphMetaFromOffset(text: string, offset: number) {
@@ -734,6 +841,61 @@ function buildReplacementDiffHtml(paragraphText: string, originalText: string, s
 function buildInsertedParagraphHtml(suggestion: string, revisionId?: string) {
   const revisionAttribute = revisionId ? ` data-revision-id="${escapeHtml(revisionId)}"` : "";
   return `<p${revisionAttribute}><ins class="ins-mark"${revisionAttribute}>${renderPlainTextFragment(suggestion)}</ins></p>`;
+}
+
+function getRevisionOffsetInParagraph(html: string, revisionId: string) {
+  if (typeof document === "undefined") return null;
+  const container = document.createElement("div");
+  container.innerHTML = html;
+  let offset = 0;
+  // Keep the value inside an object because TypeScript cannot infer writes
+  // performed by the recursive DOM walk closure.
+  const located: { value: { from: number; to: number } | null } = { value: null };
+
+  const visit = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      offset += node.textContent?.length ?? 0;
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+
+    const tag = node.tagName.toLowerCase();
+    if (tag === "del") return;
+    if (tag === "ins" && node.getAttribute("data-revision-id") === revisionId) {
+      const from = offset;
+      offset += node.textContent?.length ?? 0;
+      located.value = { from, to: offset };
+      return;
+    }
+    for (const child of Array.from(node.childNodes)) visit(child);
+  };
+
+  for (const child of Array.from(container.childNodes)) visit(child);
+  return located.value;
+}
+
+function removeRevisionMarkup(html: string, revisionId: string) {
+  if (typeof document === "undefined") return null;
+  const container = document.createElement("div");
+  container.innerHTML = html;
+  const inserts = Array.from(container.querySelectorAll("ins.ins-mark"))
+    .filter((node) => node.getAttribute("data-revision-id") === revisionId);
+  if (!inserts.length) return null;
+
+  for (const insert of inserts) {
+    const previous = insert.previousElementSibling;
+    const deleted = previous?.matches("del.del-mark") && previous.getAttribute("data-revision-id") === revisionId
+      ? previous
+      : null;
+    if (deleted?.parentNode) {
+      while (deleted.firstChild) {
+        deleted.parentNode.insertBefore(deleted.firstChild, deleted);
+      }
+      deleted.remove();
+    }
+    insert.remove();
+  }
+  return container.innerHTML;
 }
 
 function apiHeaders() {
@@ -791,6 +953,57 @@ async function getContractOverview(file: File): Promise<ContractOverviewResponse
       warnings: Array.isArray(payload.overview.warnings) ? payload.overview.warnings.filter((item): item is string => typeof item === "string") : []
     },
     document_quality: payload.document_quality ?? null
+  };
+}
+
+function normalizeIntakeCriteria(value: unknown): IntakeReviewCriteria {
+  if (!value || typeof value !== "object") return { ...emptyIntakeCriteria };
+  const source = value as Record<string, unknown>;
+  const list = (key: string, limit: number) => Array.isArray(source[key])
+    ? source[key].filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, limit)
+    : [];
+  return {
+    party_role: source.party_role === "party_a" || source.party_role === "party_b" || source.party_role === "other" ? source.party_role : null,
+    other_party_role: typeof source.other_party_role === "string" ? source.other_party_role : "",
+    deal_priorities: list("deal_priorities", 6),
+    focus_areas: list("focus_areas", 8),
+    review_style: source.review_style === "balanced" || source.review_style === "material_only" ? source.review_style : "protective",
+    business_context: typeof source.business_context === "string" ? source.business_context : "",
+    non_negotiables: typeof source.non_negotiables === "string" ? source.non_negotiables : "",
+    special_requirements: list("special_requirements", 8),
+    additional_notes: list("additional_notes", 5)
+  };
+}
+
+async function continueIntakeChat(
+  overview: ContractOverviewResponse,
+  messages: IntakeChatMessage[],
+  criteria: IntakeReviewCriteria,
+): Promise<IntakeChatResponse> {
+  const response = await fetch("/api/intake/chat", {
+    method: "POST",
+    headers: { ...apiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contract_text: overview.contract_text,
+      overview: overview.overview,
+      messages,
+      criteria
+    })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? `法务助手对话请求失败（${response.status}）。`);
+  }
+  const payload = await response.json() as Partial<IntakeChatResponse>;
+  if (typeof payload.assistant_message !== "string" || !payload.assistant_message.trim()) {
+    throw new Error("法务助手未返回下一步问题，请重试。");
+  }
+  return {
+    assistant_message: payload.assistant_message.trim(),
+    criteria: normalizeIntakeCriteria(payload.criteria),
+    ready_for_review: payload.ready_for_review === true,
+    source: payload.source === "model" ? "model" : "fallback",
+    warning: typeof payload.warning === "string" ? payload.warning : null
   };
 }
 
@@ -1032,19 +1245,6 @@ async function exportReviewedContract(file: File, modifications: Modification[])
   };
 }
 
-async function exportReviewReport(review: ReviewResponse) {
-  const response = await fetch("/api/report", {
-    method: "POST",
-    headers: { ...apiHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify(review)
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Report request failed with status ${response.status}.`);
-  }
-  return response.blob();
-}
-
 async function recordReviewFeedback(
   filename: string,
   riskItem: string,
@@ -1095,7 +1295,6 @@ export default function App() {
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [isReportExporting, setIsReportExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [manualInsertRiskKey, setManualInsertRiskKey] = useState<string | null>(null);
   const [manualInsertAfterText, setManualInsertAfterText] = useState("");
@@ -1120,6 +1319,12 @@ export default function App() {
     non_negotiables: "",
     additional_notes: []
   });
+  const [intakeMessages, setIntakeMessages] = useState<IntakeChatMessage[]>([]);
+  const [intakeCriteria, setIntakeCriteria] = useState<IntakeReviewCriteria>(emptyIntakeCriteria);
+  const [intakeChatDraft, setIntakeChatDraft] = useState("");
+  const [isIntakeChatLoading, setIsIntakeChatLoading] = useState(false);
+  const [intakeReadyForReview, setIntakeReadyForReview] = useState(false);
+  const [intakeChatWarning, setIntakeChatWarning] = useState<string | null>(null);
   const [additionalNoteDraft, setAdditionalNoteDraft] = useState("");
   const [intakeConversationStep, setIntakeConversationStep] = useState<IntakeConversationStep>("role");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -1160,13 +1365,11 @@ export default function App() {
     [preflightChecks]
   );
   const risksWithKeys = useMemo<RiskWithKey[]>(() => {
-    return sortedRisks.map((risk, index) => ({ risk, riskKey: getRiskKey(risk, index) }));
+    return sortedRisks.map((risk) => ({ risk, riskKey: getRiskKey(risk) }));
   }, [sortedRisks]);
   const unlocatableRisks = useMemo(
-    () => risksWithKeys.filter(({ risk }) => {
-      const alreadyApplied = modifications.some((item) => (
-        item.item === risk.item && item.original === risk.original_text
-      ));
+    () => risksWithKeys.filter(({ risk, riskKey }) => {
+      const alreadyApplied = modifications.some((item) => isRiskModification(item, risk, riskKey));
       return !alreadyApplied
         && !isMissingClause(risk.original_text)
         && !findUniqueExactMatch(editorText, risk.original_text);
@@ -1180,11 +1383,11 @@ export default function App() {
     }
 
     if (riskFilter === "pending") {
-      return risksWithKeys.filter(({ risk }) => !modifications.some((item) => item.item === risk.item && (item.original === risk.original_text || (isMissingClause(risk.original_text) && item.modified === risk.suggestion))));
+      return risksWithKeys.filter(({ risk, riskKey }) => !modifications.some((item) => isRiskModification(item, risk, riskKey)));
     }
 
     if (riskFilter === "processed") {
-      return risksWithKeys.filter(({ risk }) => modifications.some((item) => item.item === risk.item && (item.original === risk.original_text || (isMissingClause(risk.original_text) && item.modified === risk.suggestion))));
+      return risksWithKeys.filter(({ risk, riskKey }) => modifications.some((item) => isRiskModification(item, risk, riskKey)));
     }
 
     return risksWithKeys.filter((entry) => entry.risk.level === riskFilter);
@@ -1198,8 +1401,8 @@ export default function App() {
   }, [sortedRisks]);
 
   const processedRiskCount = useMemo(
-    () => sortedRisks.filter((risk) => modifications.some((item) => item.item === risk.item && (item.original === risk.original_text || (isMissingClause(risk.original_text) && item.modified === risk.suggestion)))).length,
-    [modifications, sortedRisks],
+    () => risksWithKeys.filter(({ risk, riskKey }) => modifications.some((item) => isRiskModification(item, risk, riskKey))).length,
+    [modifications, risksWithKeys],
   );
 
   const reviewProgress = useMemo(() => {
@@ -1220,11 +1423,20 @@ export default function App() {
   const totalRisks = sortedRisks.length;
 
   useEffect(() => {
-    if (!isSystemStatusOpen || systemStatus) return;
+    if (!isSystemStatusOpen) return;
+    let cancelled = false;
+    setSystemStatusError(null);
     void fetchSystemStatus()
-      .then(setSystemStatus)
-      .catch((statusError) => setSystemStatusError(getErrorMessage(statusError)));
-  }, [isSystemStatusOpen, systemStatus]);
+      .then((nextStatus) => {
+        if (!cancelled) setSystemStatus(nextStatus);
+      })
+      .catch((statusError) => {
+        if (!cancelled) setSystemStatusError(getErrorMessage(statusError));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSystemStatusOpen]);
 
   useEffect(() => {
     const panel = readerPanelRef.current;
@@ -1239,19 +1451,6 @@ export default function App() {
     updateHeight();
     return () => observer.disconnect();
   }, [review, editorNotice, error]);
-
-  async function handleReportExport() {
-    if (!review || isReportExporting) return;
-    setIsReportExporting(true);
-    try {
-      const blob = await exportReviewReport(review);
-      downloadBlob(blob, `${review.filename.replace(/\.[^.]+$/, "")}-审查报告.html`);
-    } catch (exportError) {
-      setError(exportError instanceof Error ? exportError.message : "审查报告导出失败。");
-    } finally {
-      setIsReportExporting(false);
-    }
-  }
 
   function clearEditorHighlight() {
     if (highlightedParagraphRef.current) {
@@ -1427,6 +1626,12 @@ export default function App() {
     });
     setAdditionalNoteDraft("");
     setIntakeConversationStep("role");
+    setIntakeMessages([]);
+    setIntakeCriteria(emptyIntakeCriteria);
+    setIntakeChatDraft("");
+    setIsIntakeChatLoading(false);
+    setIntakeReadyForReview(false);
+    setIntakeChatWarning(null);
     setReviewStage("upload");
     setContractOverview(null);
     setIsSidebarCollapsed(false);
@@ -1498,6 +1703,7 @@ export default function App() {
       setContractOverview(overview);
       setReviewStage("intake");
       setEditorNotice(null);
+      await requestIntakeAssistant(overview, [], emptyIntakeCriteria);
     } catch (submitError) {
       setError(getErrorMessage(submitError));
     } finally {
@@ -1618,10 +1824,7 @@ export default function App() {
 
   function focusRisk(risk: ReviewRisk, riskKey: string) {
     setActiveRiskKey(riskKey);
-    const appliedModification = modifications.find((item) => (
-      item.item === risk.item
-      && (item.original === risk.original_text || (isMissingClause(risk.original_text) && item.modified === risk.suggestion))
-    ));
+    const appliedModification = modifications.find((item) => isRiskModification(item, risk, riskKey));
     if (appliedModification && revealAppliedRevision(appliedModification)) {
       riskCardRefs.current[riskKey]?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -1681,9 +1884,10 @@ export default function App() {
       anchorMeta ? `已在指定段落后追加“${risk.item}”的补充条款。` : `已追加“${risk.item}”的补充条款到合同末尾。`
     );
     setModifications((previous) => [
-      ...previous.filter((item) => item.modified !== risk.suggestion),
+      ...previous.filter((item) => !isRiskModification(item, risk, riskKey)),
       {
         item: risk.item,
+        risk_key: riskKey,
         original: MISSING_SENTINEL,
         modified: risk.suggestion,
         revision_id: revisionId,
@@ -1736,9 +1940,10 @@ export default function App() {
     setError(null);
     setEditorNotice(`已在您确认的段落中引用“${risk.item}”的修改建议。`);
     setModifications((previous) => [
-      ...previous.filter((item) => item.original !== original),
+      ...previous.filter((item) => !isRiskModification(item, risk, riskKey)),
       {
         item: risk.item,
+        risk_key: riskKey,
         original,
         modified: risk.suggestion,
         revision_id: revisionId,
@@ -1815,9 +2020,10 @@ export default function App() {
     setError(null);
     setEditorNotice(`已引用“${risk.item}”的修改建议。`);
     setModifications((previous) => [
-      ...previous.filter((item) => item.original !== risk.original_text),
+      ...previous.filter((item) => !isRiskModification(item, risk, riskKey)),
       {
         item: risk.item,
+        risk_key: riskKey,
         original: risk.original_text,
         modified: risk.suggestion,
         revision_id: revisionId,
@@ -1831,40 +2037,41 @@ export default function App() {
     revealEditorSelection(Math.max(1, originalIndex + 1), Math.max(1, originalIndex + risk.suggestion.length + 1));
   }
 
-  function undoRiskModification(risk: ReviewRisk) {
-    const applied = modifications.find((item) => item.item === risk.item && item.original === risk.original_text);
+  function undoRiskModification(risk: ReviewRisk, riskKey: string) {
+    const applied = modifications.find((item) => isRiskModification(item, risk, riskKey));
     if (!applied) return;
-    const currentMatch = findUniqueExactMatch(editorText, applied.modified);
-    if (!currentMatch) {
-      setError("无法自动撤销：修改后的文字已被再次编辑或出现多次。请在左侧正文中手动恢复原文。 ");
-      return;
-    }
-    const restoredText = editorText.slice(0, currentMatch.from) + applied.original + editorText.slice(currentMatch.to);
-    const paragraphMeta = getParagraphMetaFromOffset(editorText, currentMatch.from);
-    if (!editor || !paragraphMeta) {
-      setError("无法自动撤销：未能确定这项修改所在的合同段落。请在左侧正文中手动恢复原文。");
+    if (!editor || !applied.revision_id) {
+      setError("无法自动撤销：未找到本项修订标识，请在左侧正文中手动恢复原文。");
       return;
     }
 
-    // Each system-applied risk owns one source paragraph. Rebuild only that
-    // paragraph as plain source text; all other paragraph HTML (including
-    // their <del>/<ins> revision marks) stays exactly as it was.
-    const relativeFrom = currentMatch.from - paragraphMeta.start;
-    const relativeTo = currentMatch.to - paragraphMeta.start;
-    const restoredParagraph = (
-      paragraphMeta.text.slice(0, relativeFrom)
-      + applied.original
-      + paragraphMeta.text.slice(relativeTo)
-    );
     const htmlParagraphs = getHtmlParagraphs(editor.getHTML());
-    if (!htmlParagraphs[paragraphMeta.index]) {
-      setError("无法自动撤销：正文结构已变化，请在左侧正文中手动恢复原文。");
+    const paragraphIndex = htmlParagraphs.findIndex((paragraph) => paragraph.includes(`data-revision-id="${escapeHtml(applied.revision_id!)}"`));
+    const revisionParagraph = paragraphIndex >= 0 ? htmlParagraphs[paragraphIndex] : null;
+    if (!revisionParagraph) {
+      setError("无法自动撤销：该修订痕迹已被手动改动，请在左侧正文中恢复原文。");
       return;
     }
-    htmlParagraphs[paragraphMeta.index] = `<p>${renderPlainTextFragment(restoredParagraph)}</p>`;
+
+    const paragraphs = textToParagraphs(editorText);
+    if (applied.original === MISSING_SENTINEL) {
+      htmlParagraphs.splice(paragraphIndex, 1);
+      paragraphs.splice(paragraphIndex, 1);
+    } else {
+      const position = getRevisionOffsetInParagraph(revisionParagraph, applied.revision_id);
+      const nextRevisionParagraph = removeRevisionMarkup(revisionParagraph, applied.revision_id);
+      const currentParagraph = paragraphs[paragraphIndex];
+      if (!position || !nextRevisionParagraph || !currentParagraph || currentParagraph.slice(position.from, position.to) !== applied.modified) {
+        setError("无法自动撤销：该修订痕迹已被手动改动，请在左侧正文中恢复原文。");
+        return;
+      }
+      paragraphs[paragraphIndex] = currentParagraph.slice(0, position.from) + applied.original + currentParagraph.slice(position.to);
+      htmlParagraphs[paragraphIndex] = nextRevisionParagraph;
+    }
+
     editor.commands.setContent(htmlParagraphs.join(""));
-    setEditorText(restoredText);
-    setModifications((previous) => previous.filter((item) => item !== applied));
+    setEditorText(paragraphs.join("\n"));
+    setModifications((previous) => previous.filter((item) => !isRiskModification(item, risk, riskKey)));
     setEditorNotice(`已撤销“${risk.item}”的系统修改；其他已应用内容保持不变。`);
     setError(null);
   }
@@ -1986,6 +2193,41 @@ export default function App() {
     setError(null);
   }
 
+  async function requestIntakeAssistant(
+    overview: ContractOverviewResponse,
+    messages: IntakeChatMessage[],
+    criteria: IntakeReviewCriteria,
+  ) {
+    setIsIntakeChatLoading(true);
+    setIntakeChatWarning(null);
+    try {
+      const response = await continueIntakeChat(overview, messages, criteria);
+      const nextMessages = [...messages, { role: "assistant" as const, content: response.assistant_message }].slice(-12);
+      setIntakeMessages(nextMessages);
+      setIntakeCriteria(response.criteria);
+      setDeepReviewSettings(criteriaToDeepReviewSettings(response.criteria, overview.overview));
+      setIntakeReadyForReview(response.ready_for_review);
+      setIntakeChatWarning(response.warning ?? null);
+      setError(null);
+    } catch (chatError) {
+      setError(getErrorMessage(chatError));
+      setIntakeChatWarning("法务助手暂时没有回应。您可以重试；合同内容和已输入的回答都会保留。");
+    } finally {
+      setIsIntakeChatLoading(false);
+    }
+  }
+
+  async function sendIntakeChatMessage(event?: FormEvent) {
+    event?.preventDefault();
+    if (!contractOverview || isIntakeChatLoading) return;
+    const content = intakeChatDraft.trim();
+    if (!content) return;
+    const nextMessages = [...intakeMessages, { role: "user" as const, content }].slice(-12);
+    setIntakeMessages(nextMessages);
+    setIntakeChatDraft("");
+    await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria);
+  }
+
   async function runDeepReview() {
     if (!contractOverview) return;
     if (!deepReviewSettings.party_role) {
@@ -1997,20 +2239,7 @@ export default function App() {
       return;
     }
 
-    const pendingNote = additionalNoteDraft.trim();
-    const settingsForReview: DeepReviewFormSettings = pendingNote && !deepReviewSettings.additional_notes.includes(pendingNote)
-      ? { ...deepReviewSettings, additional_notes: [...deepReviewSettings.additional_notes, pendingNote].slice(0, 5) }
-      : deepReviewSettings;
-
-    if (pendingNote.length > 500) {
-      setError("单条补充内容请控制在 500 字以内，便于模型准确理解。");
-      return;
-    }
-
-    if (settingsForReview !== deepReviewSettings) {
-      setDeepReviewSettings(settingsForReview);
-      setAdditionalNoteDraft("");
-    }
+    const settingsForReview: DeepReviewFormSettings = deepReviewSettings;
     setIsLoading(true);
     setError(null);
     try {
@@ -2145,6 +2374,11 @@ export default function App() {
             <span>企业合同审阅工作台</span>
           </div>
         </div>
+        <div className="topbar-session" aria-label="当前工作区">
+          <span className="topbar-session-dot" aria-hidden="true" />
+          <span>合同审查会话</span>
+          <small>{review ? "修订工作台" : contractOverview ? "需求确认中" : "新建审查"}</small>
+        </div>
         <div className="system-status-container">
           <button
             className="system-status-btn"
@@ -2188,18 +2422,51 @@ export default function App() {
         </div>
       </header>
 
-      <input
-        ref={fileInputRef}
-        className="hidden-file-input"
-        type="file"
-        accept=".docx,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf"
-        onChange={handleFileChange}
-      />
+      <div className="workbench-shell">
+        <aside className="workbench-sidebar" aria-label="本次合同审查导航">
+          <div className="workbench-sidebar-heading">
+            <span>本次工作区</span>
+            <strong>合同审查</strong>
+          </div>
+          <nav className="workbench-flow" aria-label="审查流程进度">
+            <div className={`workbench-flow-item ${file ? "workbench-flow-complete" : "workbench-flow-active"}`}>
+              <b>01</b>
+              <span>导入合同<small>{file ? "已读取文件" : "等待上传"}</small></span>
+            </div>
+            <div className={`workbench-flow-item ${contractOverview ? (review ? "workbench-flow-complete" : "workbench-flow-active") : ""}`}>
+              <b>02</b>
+              <span>确认审查方向<small>{contractOverview ? (review ? "标准已确认" : "与 AI 沟通中") : "待开始"}</small></span>
+            </div>
+            <div className={`workbench-flow-item ${review ? "workbench-flow-active" : ""}`}>
+              <b>03</b>
+              <span>审查与修订<small>{review ? "查看风险与修改" : "待执行"}</small></span>
+            </div>
+          </nav>
+          <div className="workbench-file-summary">
+            <span>当前文件</span>
+            <strong title={currentFilename}>{currentFilename}</strong>
+            <small>{currentFileSize ?? "上传后将在此显示文件信息"}</small>
+          </div>
+          <div className="workbench-sidebar-footer">
+            <span className="workbench-sidebar-footer-dot" aria-hidden="true" />
+            本地会话 · 合同内容仅用于本次审查
+          </div>
+        </aside>
 
-      {!review ? (
+        <div className="workbench-main">
+          <input
+            ref={fileInputRef}
+            className="hidden-file-input"
+            type="file"
+            accept=".docx,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf"
+            onChange={handleFileChange}
+          />
+
+          {!review ? (
         contractOverview ? (
           <section className="intake-container" aria-busy={isLoading}>
             <div className="upload-header intake-header">
+              <span className="upload-eyebrow">合同审查会话</span>
               <div className="workflow-steps" aria-label="审查流程">
                 <span className="workflow-step workflow-step-complete"><b>1</b>上传合同</span>
                 <i aria-hidden="true" />
@@ -2226,6 +2493,57 @@ export default function App() {
               </section>
 
               <section className="deep-review-settings intake-review-settings" aria-label="审查立场与诉求">
+                <div className="intake-chat-native">
+                  <div className="intake-chat-session" aria-label="会话状态">
+                    <span className="intake-chat-avatar" aria-hidden="true">AI</span>
+                    <div>
+                      <strong>AI 法务助手</strong>
+                      <span>已读取：{contractOverview.overview.contract_type || "当前合同"} · 正在确定审查标准</span>
+                    </div>
+                    <b>{intakeReadyForReview ? "可开始审查" : "引导中"}</b>
+                  </div>
+                  <div className="deep-review-heading">
+                    <div>
+                      <strong>和 AI 法务助手聊聊这份合同</strong>
+                      <span>请用日常语言回答。助手会根据合同内容逐步厘清我方立场、目标、顾虑与底线。</span>
+                    </div>
+                    <b>{intakeReadyForReview ? "标准已就绪" : "对话中"}</b>
+                  </div>
+                  <section className="intake-model-chat" aria-label="AI 法务助手对话" aria-live="polite">
+                    {intakeMessages.length ? intakeMessages.map((message, index) => (
+                      <article className={`intake-message intake-message-${message.role}`} key={`${message.role}-${index}-${message.content.slice(0, 20)}`}>
+                        <div className="intake-message-meta">
+                          <span className="intake-message-avatar" aria-hidden="true">{message.role === "assistant" ? "AI" : "您"}</span>
+                          <b>{message.role === "assistant" ? "AI 法务助手" : "您"}</b>
+                        </div>
+                        <p>{message.content}</p>
+                      </article>
+                    )) : <article className="intake-message intake-message-assistant"><div className="intake-message-meta"><span className="intake-message-avatar" aria-hidden="true">AI</span><b>AI 法务助手</b></div><p>正在阅读合同并准备第一个问题…</p></article>}
+                    {isIntakeChatLoading ? <article className="intake-message intake-message-assistant intake-message-typing"><div className="intake-message-meta"><span className="intake-message-avatar" aria-hidden="true">AI</span><b>AI 法务助手</b></div><p>正在整理合同信息…</p></article> : null}
+                  </section>
+                  <form className="intake-model-compose" onSubmit={(event) => void sendIntakeChatMessage(event)}>
+                    <div className="intake-compose-field">
+                      <label htmlFor="intake-chat-input">回复 AI 法务助手</label>
+                      <textarea id="intake-chat-input" value={intakeChatDraft} maxLength={2000} disabled={isIntakeChatLoading} onChange={(event) => setIntakeChatDraft(event.target.value)} placeholder="例如：我是采购方，项目必须按期上线；不能接受默认验收，也不能让对方使用我们的数据训练模型。" />
+                      <small>用日常语言描述目标、顾虑或底线即可；这些信息不会自动写入合同。</small>
+                    </div>
+                    <button type="submit" disabled={isIntakeChatLoading || !intakeChatDraft.trim()}>{isIntakeChatLoading ? "思考中" : "发送"}</button>
+                  </form>
+                  {intakeChatWarning ? <p className="intake-chat-warning" role="status">{intakeChatWarning}</p> : null}
+                  <aside className="intake-review-summary" aria-live="polite">
+                    <strong>当前已确认的审核标准</strong>
+                    <p>{[
+                      intakeCriteria.party_role === "party_a" ? "我方为甲方/采购方" : intakeCriteria.party_role === "party_b" ? "我方为乙方/供应方" : intakeCriteria.party_role === "other" ? `我方角色：${intakeCriteria.other_party_role || "待补充"}` : "我方身份待确认",
+                      intakeCriteria.business_context && `业务目标：${intakeCriteria.business_context}`,
+                      intakeCriteria.focus_areas.length && `重点：${intakeCriteria.focus_areas.join("、")}`,
+                      intakeCriteria.non_negotiables && `底线：${intakeCriteria.non_negotiables}`
+                    ].filter(Boolean).join("；")}</p>
+                    <small>这些内容只会作为后续审查的立场与谈判偏好，不会被视为合同中已经约定的事实。</small>
+                  </aside>
+                  {error ? <p className="error-message intake-error">{error}</p> : null}
+                  <button className="primary-button deep-review-start" type="button" disabled={isLoading || isIntakeChatLoading || !intakeReadyForReview || !deepReviewSettings.party_role} onClick={() => void runDeepReview()}>{isLoading ? "正在进行综合审查…" : intakeReadyForReview ? "按当前标准开始综合审查" : "请先完成 AI 问答"}</button>
+                </div>
+                <div hidden aria-hidden="true">
                 <div className="deep-review-heading">
                   <div><strong>和法务助手确认审阅方向</strong><span>不用填写复杂表单；系统会根据合同内容和您的回答生成审阅重点。</span></div>
                   <b>对话确认</b>
@@ -2390,12 +2708,14 @@ export default function App() {
                 </aside>
                 {error ? <p className="error-message intake-error">{error}</p> : null}
                 <button className="primary-button deep-review-start" type="button" disabled={isLoading || !deepReviewSettings.party_role} onClick={() => void runDeepReview()}>{isLoading ? "正在进行综合审查…" : "开始综合审查"}</button>
+                </div>
               </section>
             </div>
           </section>
         ) : (
         <div className="upload-container">
           <div className="upload-header">
+            <span className="upload-eyebrow">AI 合同审查工作台</span>
             <div className="workflow-steps" aria-label="审核流程">
               <span className="workflow-step workflow-step-active"><b>1</b>上传合同</span>
               <i aria-hidden="true" />
@@ -2607,9 +2927,6 @@ export default function App() {
                     <h2>审查结果</h2>
                     {review.contract_type ? <p className="result-subtitle">合同类型：{review.contract_type}</p> : null}
                   </div>
-                  <button className="secondary-button compact-review-btn" type="button" onClick={() => void handleReportExport()} disabled={isReportExporting}>
-                    {isReportExporting ? "导出中…" : "导出审查报告"}
-                  </button>
                   <button
                     className="sidebar-collapse-btn"
                     type="button"
@@ -2876,13 +3193,7 @@ export default function App() {
                   {filteredRisks.length ? (
                     filteredRisks.map(({ risk, riskKey }) => {
                       const showManualInsert = manualInsertRiskKey === riskKey && isMissingClause(risk.original_text);
-                      const appliedModification = modifications.find((item) => (
-                        item.item === risk.item
-                        && (
-                          item.original === risk.original_text
-                          || (isMissingClause(risk.original_text) && item.modified === risk.suggestion)
-                        )
-                      ));
+                      const appliedModification = modifications.find((item) => isRiskModification(item, risk, riskKey));
                       const accepted = Boolean(appliedModification);
                       const originalLocated = !isMissingClause(risk.original_text) && Boolean(findUniqueExactMatch(editorText, risk.original_text));
                       // Once a verified risk has been written into the
@@ -2944,7 +3255,7 @@ export default function App() {
                                         : "引用修改"}
                               </button>
                               {accepted && appliedModification ? (
-                                <button className="secondary-button inline-button" type="button" onClick={() => undoRiskModification(risk)}>
+                                <button className="secondary-button inline-button" type="button" onClick={() => undoRiskModification(risk, riskKey)}>
                                   撤销本项
                                 </button>
                               ) : null}
@@ -3095,7 +3406,9 @@ export default function App() {
             </section>
           </aside>
         </section>
-      )}
+          )}
+        </div>
+      </div>
     </main>
   );
 }
