@@ -16,6 +16,8 @@ from app.schemas.review import (
     DocumentQuality,
     IntakeChatRequest,
     IntakeChatResponse,
+    LegalResearchRequest,
+    LegalResearchResponse,
     ReviewFeedback,
     ReviewResponse,
     TextReviewRequest,
@@ -32,6 +34,7 @@ from app.services.openai_review import review_contract_text
 from app.services.deep_review import review_contract_deeply
 from app.services.contract_overview import create_contract_overview
 from app.services.intake_chat import continue_intake_chat
+from app.services.legal_research_chat import continue_legal_research_chat
 from app.services.review_report import render_review_report
 from app.services.request_auth import require_request_identity
 
@@ -307,6 +310,17 @@ async def continue_intake_conversation(
     """Turn a free-form pre-review chat into later deep-review settings."""
     require_request_identity(x_api_token, x_tenant_id)
     return await run_in_threadpool(continue_intake_chat, request)
+
+
+@app.post("/api/legal-research/chat", response_model=LegalResearchResponse)
+async def continue_legal_research_conversation(
+    request: LegalResearchRequest,
+    x_api_token: str | None = Header(default=None),
+    x_tenant_id: str | None = Header(default=None),
+) -> LegalResearchResponse:
+    """Answer general legal questions without changing the contract review plan."""
+    require_request_identity(x_api_token, x_tenant_id)
+    return await run_in_threadpool(continue_legal_research_chat, request)
 
 
 @app.post("/api/review/text", response_model=ReviewResponse)

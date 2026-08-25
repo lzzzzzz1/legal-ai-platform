@@ -155,6 +155,20 @@ class IntakeChatResponse(BaseModel):
     warning: str | None = None
 
 
+class LegalResearchRequest(BaseModel):
+    """A standalone legal-information turn, optionally grounded in the uploaded contract."""
+
+    messages: list[IntakeChatMessage] = Field(min_length=1, max_length=12)
+    contract_context: str = Field(default="", max_length=12_000)
+
+
+class LegalResearchResponse(BaseModel):
+    assistant_message: str = Field(min_length=1, max_length=2_500)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=4)
+    source: Literal["model", "fallback"] = "fallback"
+    warning: str | None = None
+
+
 class DocumentPreflightCheck(BaseModel):
     """A lightweight, deterministic document-quality check.
 

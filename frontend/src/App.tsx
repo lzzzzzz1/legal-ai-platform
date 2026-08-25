@@ -129,6 +129,7 @@ type ContractOverviewResponse = {
 type IntakeChatMessage = {
   role: "assistant" | "user";
   content: string;
+  intent?: "intake" | "legal_research";
   quick_replies?: string[];
   suggested_questions?: string[];
 };
@@ -151,6 +152,13 @@ type IntakeChatResponse = {
   suggested_questions: string[];
   criteria: IntakeReviewCriteria;
   ready_for_review: boolean;
+  source: "model" | "fallback";
+  warning?: string | null;
+};
+
+type LegalResearchResponse = {
+  assistant_message: string;
+  suggested_questions: string[];
   source: "model" | "fallback";
   warning?: string | null;
 };
@@ -1042,6 +1050,46 @@ async function continueIntakeChat(
   };
 }
 
+async function continueLegalResearch(
+  messages: IntakeChatMessage[],
+  contractContext?: string,
+): Promise<LegalResearchResponse> {
+  const response = await fetch("/api/legal-research/chat", {
+    method: "POST",
+    headers: { ...apiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages: messages.slice(-12).map(({ role, content }) => ({ role, content })),
+      contract_context: contractContext?.slice(0, 12_000) ?? "",
+    }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? `法规咨询请求失败（${response.status}）。`);
+  }
+  const payload = await response.json() as Partial<LegalResearchResponse>;
+  if (typeof payload.assistant_message !== "string" || !payload.assistant_message.trim()) {
+    throw new Error("法规咨询未返回有效回答，请重试。");
+  }
+  return {
+    assistant_message: payload.assistant_message.trim(),
+    suggested_questions: Array.isArray(payload.suggested_questions)
+      ? payload.suggested_questions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
+      : [],
+    source: payload.source === "model" ? "model" : "fallback",
+    warning: typeof payload.warning === "string" ? payload.warning : null,
+  };
+}
+
+const legalResearchSignals = [
+  "法规", "法条", "法律", "条例", "办法", "规定", "司法解释", "民法典", "公司法", "劳动法",
+  "个人信息保护法", "数据安全法", "网络安全法", "知识产权", "法律依据", "第几条", "条文",
+];
+
+function isLegalResearchQuestion(content: string) {
+  const normalized = content.replace(/\s+/g, "");
+  return legalResearchSignals.some((signal) => normalized.includes(signal));
+}
+
 async function reviewContractDeeply(
   filename: string,
   contractText: string,
@@ -1691,6 +1739,7 @@ export default function App() {
     }
 
     setFile(selectedFile);
+    void startContractIntake(selectedFile);
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -1698,18 +1747,8 @@ export default function App() {
     handleFileSelection(selectedFile);
   }
 
-  async function handleSubmit(event?: FormEvent) {
-    if (event) {
-      event.preventDefault();
-    }
-
-    if (!file) {
-      setError("请先选择一份 .docx 或 .pdf 合同。");
-      return;
-    }
-
+  async function startContractIntake(selectedFile: File) {
     const workflowEpoch = ++workflowEpochRef.current;
-    const selectedFile = file;
     setIsLoading(true);
     setError(null);
     setReview(null);
@@ -2228,6 +2267,7 @@ export default function App() {
       const nextMessages = [...messages, {
         role: "assistant" as const,
         content: response.assistant_message,
+        intent: "intake" as const,
         quick_replies: response.quick_replies,
         suggested_questions: response.suggested_questions,
       }].slice(-12);
@@ -2248,19 +2288,87 @@ export default function App() {
     }
   }
 
-  async function submitIntakeChatAnswer(answer: string) {
-    if (!contractOverview || isIntakeChatLoading) return;
+  async function handleSubmit(event?: FormEvent) {
+    if (event) {
+      event.preventDefault();
+    }
+
+    if (!file) {
+      setError("请先选择一份 .docx 或 .pdf 合同。");
+      return;
+    }
+
+    await startContractIntake(file);
+  }
+
+  async function requestLegalResearchAssistant(
+    messages: IntakeChatMessage[],
+    workflowEpoch = workflowEpochRef.current,
+  ) {
+    setIsIntakeChatLoading(true);
+    setIntakeChatWarning(null);
+    try {
+      const response = await continueLegalResearch(
+        messages.filter((message) => message.intent === "legal_research").slice(-12),
+        contractOverview ? `${contractOverview.overview.summary}\n\n${contractOverview.contract_text}` : undefined,
+      );
+      if (workflowEpochRef.current !== workflowEpoch) return;
+      setIntakeMessages((current) => [...current, {
+        role: "assistant" as const,
+        content: response.assistant_message,
+        intent: "legal_research" as const,
+        suggested_questions: response.suggested_questions,
+      }].slice(-12));
+      setIntakeChatWarning(response.warning ?? null);
+      setError(null);
+    } catch (chatError) {
+      if (workflowEpochRef.current !== workflowEpoch) return;
+      setError(getErrorMessage(chatError));
+      setIntakeChatWarning("法规咨询暂时没有回应。您可以重试；合同和既定审核方案不会改变。");
+    } finally {
+      if (workflowEpochRef.current === workflowEpoch) {
+        setIsIntakeChatLoading(false);
+      }
+    }
+  }
+
+  async function submitIntakeChatAnswer(answer: string, preferredIntent?: "intake" | "legal_research") {
+    if (isIntakeChatLoading) return;
     const content = answer.trim();
     if (!content) return;
-    const nextMessages = [...intakeMessages, { role: "user" as const, content }].slice(-12);
+    const lastAssistant = [...intakeMessages].reverse().find((message) => message.role === "assistant");
+    const intent = preferredIntent
+      ?? (!contractOverview || isLegalResearchQuestion(content) || lastAssistant?.intent === "legal_research" ? "legal_research" : "intake");
+    const nextMessages = [...intakeMessages, { role: "user" as const, content, intent }].slice(-12);
     setIntakeMessages(nextMessages);
     setIntakeChatDraft("");
-    await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria, workflowEpochRef.current);
+    if (intent === "legal_research") {
+      await requestLegalResearchAssistant(nextMessages, workflowEpochRef.current);
+      return;
+    }
+    if (contractOverview) {
+      await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria, workflowEpochRef.current);
+    }
   }
 
   async function sendIntakeChatMessage(event?: FormEvent) {
     event?.preventDefault();
     await submitIntakeChatAnswer(intakeChatDraft);
+  }
+
+  function stopIntakeDraft() {
+    // Invalidate any response still in flight. Its result will be ignored, and
+    // the unconfirmed last user message is removed from the next model prompt.
+    workflowEpochRef.current += 1;
+    setIsLoading(false);
+    setIsIntakeChatLoading(false);
+    setIntakeChatDraft("");
+    setIntakeMessages((current) => {
+      const lastMessage = current[current.length - 1];
+      return lastMessage?.role === "user" ? current.slice(0, -1) : current;
+    });
+    setError(null);
+    setIntakeChatWarning(null);
   }
 
   async function runDeepReview() {
@@ -2412,22 +2520,8 @@ export default function App() {
       <div className="legal-chat-timeline" aria-live="polite" ref={intakeTimelineRef}>
         {!contractOverview ? (
           <section className="legal-chat-welcome" aria-label="开始合同审查">
-            <h1>今天需要审查什么合同？</h1>
-            <p>上传 Word 或 PDF 合同。AI 会先阅读全文，再通过简短对话确认您的身份、目标与底线。</p>
-            <button
-              className="legal-chat-upload-card"
-              type="button"
-              disabled={isLoading || isIntakeChatLoading}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <span className="legal-chat-upload-card-icon" aria-hidden="true">＋</span>
-              <span>
-                <strong>{file ? "更换当前合同" : "上传合同并开始"}</strong>
-                <small>{file ? `${file.name} · ${formatFileSize(file.size)}` : "支持 DOCX / PDF，单个文件最大 10MB"}</small>
-              </span>
-              <b>{file ? "重新选择" : "选择文件"}</b>
-            </button>
-            <small className="legal-chat-privacy-note">合同内容仅用于本次审查会话，不会被当作合同既有事实之外的依据。</small>
+            <h1>今天需要处理什么法律问题？</h1>
+            <p>上传 Word 或 PDF 可开始合同审查；也可直接咨询法规、法条与合同条款问题。</p>
           </section>
         ) : null}
 
@@ -2436,7 +2530,7 @@ export default function App() {
             <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
             <div className="legal-chat-message-body">
               <b>AI 法务助手</b>
-              <p>{file ? "合同已加入会话。点击下方“读取合同”，我会先提炼合同内容，再开始确认审查方向。" : "您也可以先了解流程：上传合同 → 确认审查诉求 → 自动审查与修订。"}</p>
+              <p>{file ? "合同已加入会话，正在读取并提炼合同内容，随后开始确认审查方向。" : "您可以直接咨询法规、法条与合同问题；上传合同后，我会在不改变既定审查方案的前提下继续协助。"}</p>
             </div>
           </article>
         ) : null}
@@ -2447,7 +2541,7 @@ export default function App() {
               <span className="legal-chat-file-icon" aria-hidden="true">DOC</span>
               <div>
                 <b>{file.name}</b>
-                <span>{formatFileSize(file.size)} · {contractOverview ? "合同已读取" : "已添加到会话"}</span>
+                <span>{formatFileSize(file.size)} · {contractOverview ? "合同已读取" : isLoading ? "正在读取" : "已添加到会话"}</span>
               </div>
               <button type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()}>更换</button>
             </div>
@@ -2475,7 +2569,7 @@ export default function App() {
           </article>
         ) : null}
 
-        {contractOverview && intakeMessages.map((message, index) => {
+        {intakeMessages.map((message, index) => {
           const isLatestMessage = index === intakeMessages.length - 1;
           const quickReplies = message.role === "assistant" && isLatestMessage && !isIntakeChatLoading
             ? message.quick_replies ?? []
@@ -2528,7 +2622,7 @@ export default function App() {
         {isIntakeChatLoading ? (
           <article className="legal-chat-message legal-chat-message-assistant legal-chat-message-working">
             <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
-            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>正在理解您的诉求并更新审核方案…</p></div>
+            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>{intakeMessages[intakeMessages.length - 1]?.intent === "legal_research" ? "正在整理法规信息与合同提示…" : "正在理解您的诉求并更新审核方案…"}</p></div>
           </article>
         ) : null}
 
@@ -2565,35 +2659,46 @@ export default function App() {
               return;
             }
             event.preventDefault();
-            if (file) void handleSubmit(event);
-            else fileInputRef.current?.click();
+            if (intakeChatDraft.trim()) void sendIntakeChatMessage();
+            else if (!file) fileInputRef.current?.click();
           }}
         >
           <textarea
             value={intakeChatDraft}
             maxLength={2000}
-            disabled={!contractOverview || isIntakeChatLoading || isLoading}
+            disabled={isIntakeChatLoading || isLoading}
             onChange={(event) => setIntakeChatDraft(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || !contractOverview || !intakeChatDraft.trim()) return;
+              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || !intakeChatDraft.trim()) return;
               event.preventDefault();
               void sendIntakeChatMessage();
             }}
-            placeholder={contractOverview ? "告诉 AI 您的立场、业务目标、顾虑或不可让步条件…" : file ? "合同已添加，点击右侧按钮开始读取" : "请先通过左侧＋按钮上传合同"}
+            placeholder={contractOverview ? "告诉 AI 您的立场、业务目标、顾虑，或直接查询相关法规…" : file ? "正在自动读取合同…" : "咨询法规、法条或合同问题；也可通过左侧上传文件"}
           />
           <div className="legal-chat-composer-actions">
-            <button className="legal-chat-attach" type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()} aria-label="上传或更换合同">＋</button>
-            {!isLoading ? (
-              <button
-                className={`legal-chat-send${contractOverview ? " legal-chat-send-icon" : ""}`}
-                type="submit"
-                title={contractOverview ? "发送消息" : file ? "读取合同" : "选择合同"}
-                aria-label={contractOverview ? "发送消息" : file ? "读取合同" : "选择合同"}
-                disabled={isIntakeChatLoading || (Boolean(contractOverview) && !intakeChatDraft.trim())}
-              >
-                {contractOverview ? isIntakeChatLoading ? "…" : "↑" : file ? "读取合同" : "选择合同"}
+            <div className="legal-chat-composer-left-actions">
+              <button className="legal-chat-attach" type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()}>
+                上传文件
               </button>
-            ) : null}
+              <button
+                className="legal-chat-stop"
+                type="button"
+                disabled={!isLoading && !isIntakeChatLoading && !intakeChatDraft.trim() && intakeMessages[intakeMessages.length - 1]?.role !== "user"}
+                onClick={stopIntakeDraft}
+                title="终止当前输入或正在生成的回复"
+              >
+                终止
+              </button>
+            </div>
+            <button
+              className="legal-chat-send"
+              type="submit"
+              title="Enter"
+              aria-label="Enter"
+              disabled={isLoading || isIntakeChatLoading || !intakeChatDraft.trim()}
+            >
+              {isIntakeChatLoading ? "…" : "Enter"}
+            </button>
           </div>
         </form>
         <div className="legal-chat-dock-footer">
