@@ -3,12 +3,18 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-*/
+**/.pytest-tmp/
 
 node_modules/
 dist/
 .vite/
 .npm-cache/
 *.tsbuildinfo
+*.log
 
 outputs/
 work/
+backend/logs/
+logs/
+.pytest-runtime/

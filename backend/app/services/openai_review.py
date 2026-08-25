@@ -1,19 +1,39 @@
 import json
+import logging
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from time import perf_counter
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import HTTPException, status
 from openai import OpenAI
 from pydantic import ValidationError
 
-from app.schemas.review import ReviewResponse
+from app.schemas.review import LawReference, ReviewCoverage, ReviewResponse
 from app.services.rag_service import format_laws_for_prompt, retrieve_relevant_laws
+from app.services.rule_review import RULE_TOPICS, run_rule_fallback
+from app.services.document_preflight import PREFLIGHT_SCOPE, run_document_preflight
+from app.services.review_verifier import verify_high_risk_findings
+from app.services.consistency_review import run_consistency_checks
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 BAILIAN_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 BAILIAN_DEFAULT_MODEL = "qwen-max"
-MAX_CONTRACT_CHARS = 60000
+MAX_CONTRACT_CHARS = int(os.getenv("MAX_CONTRACT_CHARS", "40000"))
+REVIEW_SEGMENT_CHARS = int(os.getenv("REVIEW_SEGMENT_CHARS", "18000"))
+REVIEW_REPAIR_TIMEOUT_SECONDS = float(os.getenv("REVIEW_REPAIR_TIMEOUT_SECONDS", "20"))
+REVIEW_JSON_RETRY_MAX_CONTRACT_CHARS = int(os.getenv("REVIEW_JSON_RETRY_MAX_CONTRACT_CHARS", "12000"))
+# Keep automatic paragraph replacement within the same safe size boundary as
+# DOCX revision generation.  This module deliberately does not import the
+# modifier service, so that review-time quote repair has no document-export
+# side effects.
+MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS = int(os.getenv("MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS", "20000"))
+REVIEW_SCOPE = [PREFLIGHT_SCOPE, *(topic.name for topic in RULE_TOPICS)]
 SUPPORTED_CONTRACT_TYPES = {
     "采购/供应合同": "采购/供应合同",
     "采购合同": "采购/供应合同",
@@ -26,6 +46,7 @@ SUPPORTED_CONTRACT_TYPES = {
     "通用商务合同": "通用商务合同",
     "通用合同": "通用商务合同",
 }
+PARAGRAPH_REFERENCE_PATTERN = re.compile(r"\[?\s*P(\d{1,5})\s*\]?", re.IGNORECASE)
 
 SYSTEM_PROMPT = (
     "你是一名资深企业法务律师，负责审阅企业间商业合同。"
@@ -33,6 +54,8 @@ SYSTEM_PROMPT = (
     "采购/供应合同、销售/服务合同、保密协议、通用商务合同。"
     "如果无法稳定判断，也必须输出通用商务合同。"
     "识别完成后，再按对应类型执行审查："
+    "基础质量与合同框架由系统本地规则预检，不需要生成风险项；"
+    "所有合同均须覆盖主体与签约权限、合同成立与效力、标的与价格、付款与发票、交付与验收、质量与售后、违约与责任、解除与终止、知识产权、保密与数据、合规与许可、通知与送达、争议解决、附件与文本一致性；"
     "采购/供应合同重点审查付款账期与比例、发票与税费、交付与验收、延期交付违约、质量保证/售后、知识产权归属、责任限制；"
     "销售/服务合同重点审查服务范围与交付标准、付款节点、SLA/违约责任、客户数据与保密、知识产权与成果归属、终止与续约；"
     "保密协议重点审查保密信息定义、保密义务范围、例外情形、保密期限、资料返还/销毁、违约责任与救济；"
@@ -56,14 +79,359 @@ def _response_format() -> dict[str, str]:
     return {"type": "json_object"}
 
 
+def _model_json_mode_enabled() -> bool:
+    """Return whether the provider can reliably enforce OpenAI JSON mode.
+
+    Some OpenAI-compatible local gateways advertise ``json_object`` but emit a
+    token-fragmented pseudo JSON response when it is enabled.  The prompt and
+    the server-side parser still enforce the schema, so JSON mode is opt-in
+    rather than silently corrupting an otherwise usable review.
+    """
+    return os.getenv("BAILIAN_RESPONSE_FORMAT", "off").strip().lower() in {
+        "json",
+        "json_object",
+        "on",
+        "true",
+        "1",
+    }
+
+
+def _json_mode_options() -> dict[str, object]:
+    return {"response_format": _response_format()} if _model_json_mode_enabled() else {}
+
+
 def _trim_contract_text(contract_text: str) -> str:
     if len(contract_text) <= MAX_CONTRACT_CHARS:
         return contract_text
 
     return (
         contract_text[:MAX_CONTRACT_CHARS]
-        + "\n\n[合同文本过长，已截取前 60000 个字符用于本次 MVP 审查。]"
+        + f"\n\n[合同文本过长，已截取前 {MAX_CONTRACT_CHARS} 个字符用于本次审查。]"
     )
+
+
+def format_contract_with_paragraph_references(contract_text: str) -> tuple[str, dict[str, str]]:
+    """Add stable, model-visible paragraph IDs without changing source text."""
+    references: dict[str, str] = {}
+    indexed_lines: list[str] = []
+    for line in contract_text.splitlines():
+        paragraph = line.strip()
+        if not paragraph:
+            continue
+        reference = f"P{len(references) + 1:03d}"
+        references[reference] = paragraph
+        indexed_lines.append(f"[{reference}] {paragraph}")
+    return "\n".join(indexed_lines) or contract_text, references
+
+
+def hydrate_review_clause_references(review: ReviewResponse, references: dict[str, str]) -> ReviewResponse:
+    """Attach an exact source-paragraph anchor for valid model paragraph IDs."""
+    resolved = 0
+    mismatched_quotes = 0
+    missing_marker = "【缺失该约定】"
+    for risk in review.risks:
+        reference_match = PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+        if not reference_match:
+            continue
+        reference = f"P{int(reference_match.group(1)):03d}"
+        paragraph = references.get(reference)
+        if not paragraph:
+            continue
+
+        original = risk.original_text.strip()
+        if original in {missing_marker, "缺失该约定"}:
+            if not risk.insert_after_text:
+                risk.insert_after_text = paragraph
+            resolved += 1
+            continue
+
+        # Keep a potentially paraphrased model quote untouched. The exact
+        # paragraph is only a safe locating anchor, never a fuzzy replacement.
+        risk.anchor_text = paragraph
+        resolved += 1
+        if original not in paragraph:
+            mismatched_quotes += 1
+
+    if resolved:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            f"已依据模型返回的段落编号补充 {resolved} 项原文定位锚点。",
+        ]))
+    if mismatched_quotes:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            f"有 {mismatched_quotes} 项模型引文与编号段落不完全一致，已提供原文段落供人工核对，不会自动改写。",
+        ]))
+    return review
+
+
+def _location_text(value: str) -> str:
+    """Normalize only layout whitespace for safe source-location comparison."""
+    return re.sub(r"\s+", "", value).strip()
+
+
+def bind_review_risks_to_unique_paragraphs(
+    review: ReviewResponse,
+    references: dict[str, str],
+) -> ReviewResponse:
+    """Bind unnumbered findings to one verified source paragraph when possible.
+
+    The first review pass occasionally omits ``clause_reference`` even though
+    it returned a verbatim quote.  Do not make the browser guess in that case:
+    resolve it against the backend's paragraph map, accepting only one exact
+    match (or a match differing solely in whitespace).  The original quote is
+    left untouched; the subsequent quote-repair pass verifies/replaces it.
+    """
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    resolved = 0
+    whitespace_resolved = 0
+
+    for risk in review.risks:
+        if risk.original_text.strip() in missing_markers:
+            continue
+        if PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip()):
+            continue
+
+        original = risk.original_text.strip()
+        anchor = (risk.anchor_text or "").strip()
+        candidates: list[tuple[str, str]] = []
+        if len(original) >= 8:
+            candidates = [(reference, paragraph) for reference, paragraph in references.items() if original in paragraph]
+
+        if len(candidates) != 1 and len(anchor) >= 8:
+            candidates = [(reference, paragraph) for reference, paragraph in references.items() if anchor in paragraph]
+
+        whitespace_only = False
+        if len(candidates) != 1:
+            normalized_original = _location_text(original)
+            normalized_anchor = _location_text(anchor)
+            if len(normalized_original) >= 8:
+                candidates = [
+                    (reference, paragraph)
+                    for reference, paragraph in references.items()
+                    if normalized_original in _location_text(paragraph)
+                ]
+                whitespace_only = len(candidates) == 1
+            if len(candidates) != 1 and len(normalized_anchor) >= 8:
+                candidates = [
+                    (reference, paragraph)
+                    for reference, paragraph in references.items()
+                    if normalized_anchor in _location_text(paragraph)
+                ]
+                whitespace_only = len(candidates) == 1
+
+        if len(candidates) == 1:
+            reference, paragraph = candidates[0]
+            risk.clause_reference = reference
+            risk.anchor_text = paragraph
+            resolved += 1
+            whitespace_resolved += int(whitespace_only)
+
+    if resolved:
+        warning = f"已按合同原文唯一匹配补充 {resolved} 项段落定位。"
+        if whitespace_resolved:
+            warning += f"其中 {whitespace_resolved} 项仅存在空格或换行差异，已按原文段落校验。"
+        review.warnings = list(dict.fromkeys([*review.warnings, warning]))
+    return review
+
+
+def recover_unreferenced_risk_locations(
+    client: OpenAI,
+    review: ReviewResponse,
+    references: dict[str, str],
+) -> ReviewResponse:
+    """Ask a narrow second-pass locator only for findings with no source ID.
+
+    Unlike a fuzzy client-side candidate list, this model pass must select one
+    paragraph ID from the immutable backend map.  The ID and returned quote are
+    validated before they are attached to a risk; a later repair pass turns a
+    valid ID into an exact quote or a whole verified source paragraph.
+    """
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    targets = [
+        {
+            "risk_index": index,
+            "item": risk.item,
+            "model_quote": risk.original_text,
+            "model_anchor": risk.anchor_text or "",
+            "risk": risk.risk,
+            "suggestion": risk.suggestion,
+        }
+        for index, risk in enumerate(review.risks)
+        if risk.original_text.strip() not in missing_markers
+        and not PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+    ]
+    if not targets:
+        return review
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a contract source locator. Return JSON only: "
+                        '{"matches":[{"risk_index":0,"clause_reference":"P001","original_text":""}]}. '
+                        "For every risk, select exactly one supplied P-number only when that paragraph directly contains "
+                        "the contractual term being reviewed. original_text must be a continuous character-for-character "
+                        "substring from that selected paragraph; return an empty clause_reference when no reliable paragraph exists."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"targets": targets, "contract_paragraphs": references}, ensure_ascii=False),
+                },
+            ],
+            temperature=0,
+            max_tokens=min(int(os.getenv("BAILIAN_LOCATION_RECOVERY_MAX_OUTPUT_TOKENS", "1600")), 2000),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **_json_mode_options(),
+        )
+        payload = _parse_json_content(response.choices[0].message.content)
+        matches = payload.get("matches", []) if isinstance(payload, dict) else []
+        recovered = 0
+        if isinstance(matches, list):
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
+                risk_index = match.get("risk_index")
+                reference_value = match.get("clause_reference")
+                quote = match.get("original_text")
+                if not isinstance(risk_index, int) or not isinstance(reference_value, str):
+                    continue
+                if not 0 <= risk_index < len(review.risks):
+                    continue
+                reference_match = PARAGRAPH_REFERENCE_PATTERN.fullmatch(reference_value.strip())
+                if not reference_match:
+                    continue
+                reference = f"P{int(reference_match.group(1)):03d}"
+                paragraph = references.get(reference)
+                if not paragraph:
+                    continue
+                risk = review.risks[risk_index]
+                risk.clause_reference = reference
+                risk.anchor_text = paragraph
+                if isinstance(quote, str) and len(quote.strip()) >= 8 and quote.strip() in paragraph:
+                    risk.original_text = quote.strip()
+                recovered += 1
+        if recovered:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"已通过二次原文定位为 {recovered} 项风险补充可验证段落编号。",
+            ]))
+    except Exception as exc:
+        logger.warning("Risk paragraph recovery skipped: %s", exc)
+    return review
+
+
+def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contract_text: str) -> ReviewResponse:
+    """Repair only model quotes that fail an exact source-text check.
+
+    This second pass is intentionally narrow: it receives the already located
+    source paragraph rather than the whole contract and may only return a
+    continuous, verbatim substring. The backend verifies the substring before
+    it can enable an automatic modification.
+    """
+    targets = []
+    missing_markers = {"【缺失该约定】", "缺失该约定"}
+    for index, risk in enumerate(review.risks):
+        original = risk.original_text.strip()
+        anchor = (risk.anchor_text or "").strip()
+        if (
+            original in missing_markers
+            or original in contract_text
+            or not anchor
+            or anchor not in contract_text
+        ):
+            continue
+        has_paragraph_reference = bool(
+            PARAGRAPH_REFERENCE_PATTERN.fullmatch((risk.clause_reference or "").strip())
+        )
+        targets.append({
+            "risk_index": index,
+            "model_quote": original,
+            "risk": risk.risk,
+            "source_paragraph": anchor,
+            "has_paragraph_reference": has_paragraph_reference,
+        })
+
+    if not targets:
+        return review
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an exact contract quote extractor. Return one JSON object only, with "
+                        '{"matches":[{"risk_index":0,"original_text":""}]}. '
+                        "For each item, original_text must be one continuous substring copied character-for-character "
+                        "from source_paragraph. Do not paraphrase, combine non-adjacent fragments, use ellipses, "
+                        "or return a clause number. Return an empty string if no reliable continuous quote exists."
+                    ),
+                },
+                {"role": "user", "content": json.dumps({"targets": targets}, ensure_ascii=False)},
+            ],
+            temperature=0,
+            max_tokens=min(int(os.getenv("BAILIAN_LOCATION_REPAIR_MAX_OUTPUT_TOKENS", "1200")), 1600),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **_json_mode_options(),
+        )
+        payload = _parse_json_content(response.choices[0].message.content)
+        matches = payload.get("matches", []) if isinstance(payload, dict) else []
+        repaired = 0
+        repaired_indexes: set[int] = set()
+        if isinstance(matches, list):
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
+                risk_index = match.get("risk_index")
+                quote = match.get("original_text")
+                if not isinstance(risk_index, int) or not isinstance(quote, str):
+                    continue
+                if not 0 <= risk_index < len(review.risks):
+                    continue
+                quote = quote.strip()
+                risk = review.risks[risk_index]
+                anchor = (risk.anchor_text or "").strip()
+                if len(quote) >= 8 and quote in anchor and quote in contract_text:
+                    risk.original_text = quote
+                    repaired += 1
+                    repaired_indexes.add(risk_index)
+        if repaired:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"已从候选合同段落逐字校验并修复 {repaired} 项定位引文。",
+            ]))
+        # A numbered paragraph is an exact source location supplied by the
+        # model against the backend's own contract index. If the model cannot
+        # isolate a smaller quote, use that verified paragraph as the source
+        # unit so the review can still be applied automatically and reversed
+        # independently. This is deliberately limited to P-number anchors;
+        # free-form headings and fuzzy candidates never take this path.
+        paragraph_replacements = 0
+        for target in targets:
+            risk_index = target["risk_index"]
+            if risk_index in repaired_indexes or not target["has_paragraph_reference"]:
+                continue
+            paragraph = target["source_paragraph"].strip()
+            if len(paragraph) < 16 or len(paragraph) > MAX_AUTO_PARAGRAPH_REPLACEMENT_CHARS:
+                continue
+            review.risks[risk_index].original_text = paragraph
+            paragraph_replacements += 1
+        if paragraph_replacements:
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                f"有 {paragraph_replacements} 项引文未能缩小到短句，已按已核验的合同段落自动定位并整段修订；可在右侧单独撤销。",
+            ]))
+    except Exception as exc:
+        # Quote repair is an accuracy enhancement; a failure must never discard
+        # an otherwise valid review or weaken the existing manual-review gate.
+        logger.warning("Risk quote repair skipped: %s", exc)
+    return review
 
 
 def _infer_contract_language(contract_text: str) -> str:
@@ -85,7 +453,7 @@ def _infer_contract_language(contract_text: str) -> str:
 
 def _normalize_review_payload(payload: object) -> dict:
     if isinstance(payload, list):
-        return {"contract_type": None, "risks": payload}
+        return {"contract_type": None, "risks": payload, "coverage": [], "review_scope": [], "warnings": []}
 
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object or an array of risks")
@@ -93,12 +461,20 @@ def _normalize_review_payload(payload: object) -> dict:
     contract_type = payload.get("contract_type")
 
     if isinstance(payload.get("risks"), list):
-        return {"contract_type": contract_type, "risks": payload["risks"]}
+        return {
+            "contract_type": contract_type,
+            "risks": payload["risks"],
+            "review_summary": payload.get("review_summary", ""),
+            "coverage": payload.get("coverage", []),
+            "review_scope": payload.get("review_scope", []),
+            "warnings": payload.get("warnings", []),
+            "deep_review": payload.get("deep_review"),
+        }
 
     for key in ("items", "results", "review"):
         value = payload.get(key)
         if isinstance(value, list):
-            return {"contract_type": contract_type, "risks": value}
+            return {"contract_type": contract_type, "risks": value, "coverage": [], "review_scope": [], "warnings": [], "deep_review": payload.get("deep_review")}
 
     raise ValueError("payload must include a risks array")
 
@@ -131,8 +507,41 @@ def _normalize_contract_type(value: object) -> str | None:
 
 def _normalize_risk_fields(payload: dict) -> dict:
     risks = payload.get("risks")
+    def normalize_coverage(value: object) -> list[dict]:
+        """Accept concise model coverage labels without weakening the API schema."""
+        if not isinstance(value, list):
+            return []
+
+        normalized: list[dict] = []
+        for entry in value:
+            if isinstance(entry, str) and entry.strip():
+                normalized.append({
+                    "topic": entry.strip(),
+                    "status": "checked",
+                    "evidence": None,
+                    "method": "model",
+                })
+            elif isinstance(entry, dict):
+                item = entry.copy()
+                if "topic" not in item:
+                    for alias in ("检查项", "审查项", "范围", "item"):
+                        if isinstance(item.get(alias), str):
+                            item["topic"] = item[alias]
+                            break
+                if isinstance(item.get("topic"), str) and item["topic"].strip():
+                    item["topic"] = item["topic"].strip()
+                    item["status"] = item.get("status") if item.get("status") in {"checked", "missing", "uncertain"} else "uncertain"
+                    item["method"] = item.get("method") if item.get("method") in {"model", "rule", "combined"} else "model"
+                    normalized.append(item)
+        return normalized
+
+    normalized_coverage = normalize_coverage(payload.get("coverage", []))
     if not isinstance(risks, list):
-        return {**payload, "contract_type": _normalize_contract_type(payload.get("contract_type"))}
+        return {
+            **payload,
+            "contract_type": _normalize_contract_type(payload.get("contract_type")),
+            "coverage": normalized_coverage,
+        }
 
     normalized_risks = []
     for risk in risks:
@@ -141,6 +550,24 @@ def _normalize_risk_fields(payload: dict) -> dict:
             continue
 
         normalized_risk = risk.copy()
+        aliases = {
+            "item": ("检查项", "检查项目", "项目", "审查项"),
+            "level": ("风险等级", "等级"),
+            "original_text": ("原文", "定位原文", "合同原文"),
+            "risk": ("风险提示", "风险说明"),
+            "suggestion": ("修改建议", "建议", "建议补充条款"),
+            "laws": ("法规依据", "参考法条", "法律依据"),
+        }
+        for target, candidates in aliases.items():
+            if target not in normalized_risk:
+                for candidate in candidates:
+                    if candidate in normalized_risk:
+                        normalized_risk[target] = normalized_risk[candidate]
+                        break
+
+        level_aliases = {"高风险": "high", "中风险": "medium", "低风险": "low", "高": "high", "中": "medium", "低": "low"}
+        if isinstance(normalized_risk.get("level"), str):
+            normalized_risk["level"] = level_aliases.get(normalized_risk["level"].strip(), normalized_risk["level"])
         laws = normalized_risk.get("laws")
         if isinstance(laws, str):
             normalized_risk["laws"] = [laws]
@@ -153,11 +580,302 @@ def _normalize_risk_fields(payload: dict) -> dict:
         **payload,
         "contract_type": _normalize_contract_type(payload.get("contract_type")),
         "risks": normalized_risks,
+        "coverage": normalized_coverage,
     }
 
 
+def _validate_law_evidence(review: ReviewResponse, relevant_laws: list[dict]) -> ReviewResponse:
+    """Flag citations that cannot be matched to the retrieved, verified law set."""
+    references = [str(law.get("label", "")).replace(" ", "") for law in relevant_laws]
+    warnings = list(review.warnings)
+    unsupported = 0
+    missing = 0
+    for risk in review.risks:
+        risk.law_references = []
+        if not risk.laws:
+            risk.evidence_status = "needs_manual_review"
+            missing += 1
+            continue
+        citation_verified = True
+        verified_labels = []
+        for citation in risk.laws:
+            normalized = str(citation).replace(" ", "")
+            matched_laws = [
+                law
+                for law, reference in zip(relevant_laws, references)
+                if normalized and (normalized in reference or reference in normalized)
+            ]
+            if not matched_laws:
+                citation_verified = False
+                unsupported += 1
+            for law in matched_laws:
+                verified_labels.append(str(law.get("label", "")))
+                reference = LawReference(
+                    label=str(law.get("label", "")),
+                    official_url=law.get("official_url"),
+                    authority=law.get("authority"),
+                    effectiveness_status=law.get("effectiveness_status"),
+                )
+                if reference not in risk.law_references:
+                    risk.law_references.append(reference)
+        risk.laws = list(dict.fromkeys(label for label in verified_labels if label))
+        risk.evidence_status = (
+            "verified"
+            if citation_verified
+            and references
+            and all(
+                reference.official_url
+                and reference.effectiveness_status == "effective"
+                for reference in risk.law_references
+            )
+            else "needs_manual_review"
+        )
+
+    if not relevant_laws and review.risks:
+        warnings.append("未检索到可核验的有效法规依据；本次风险结论需人工复核，不能视为已有法律依据支持。")
+    if missing:
+        warnings.append(f"有 {missing} 条风险未提供法规依据，已标记为需人工核验。")
+    if unsupported:
+        warnings.append(f"有 {unsupported} 条法规引用无法在本次检索结果中匹配，已标记为需人工核验。")
+    review.warnings = list(dict.fromkeys(warnings))
+    return review
+
+
+def _validate_contract_anchors(review: ReviewResponse, contract_text: str) -> ReviewResponse:
+    """Ensure every model finding can be located in the uploaded contract."""
+    missing_original = 0
+    missing_anchor = 0
+    missing_marker = "【缺失该约定】"
+    for risk in review.risks:
+        original = risk.original_text.strip()
+        if original and original != missing_marker and original not in contract_text:
+            risk.evidence_status = "needs_manual_review"
+            missing_original += 1
+        anchor = (risk.insert_after_text or risk.anchor_text or "").strip()
+        if anchor and anchor not in contract_text:
+            risk.evidence_status = "needs_manual_review"
+            missing_anchor += 1
+
+    warnings = list(review.warnings)
+    if missing_original:
+        warnings.append(f"有 {missing_original} 条风险的原文定位无法在合同中找到，已标记为需人工复核。")
+    if missing_anchor:
+        warnings.append(f"有 {missing_anchor} 条风险的插入锚点无法在合同中找到，已标记为需人工复核。")
+    review.warnings = list(dict.fromkeys(warnings))
+    return review
+
+
+def _audit_review(*, filename: str, raw_response: str, duration_ms: int, status: str, risk_count: int, error: str | None = None) -> None:
+    """Write an append-only, local audit record without logging API keys or contract text."""
+    path = Path(os.getenv("REVIEW_AUDIT_LOG", "logs/reviews.jsonl"))
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    redact = os.getenv("REVIEW_AUDIT_REDACT", "true").lower() in {"1", "true", "yes"}
+    audited_response = _redact_audit_text(raw_response) if redact else raw_response
+    record = {
+        "review_id": str(uuid4()),
+        "filename": filename,
+        "duration_ms": duration_ms,
+        "status": status,
+        "risk_count": risk_count,
+        "raw_model_response": audited_response,
+        "raw_response_redacted": redact,
+    }
+    if error:
+        record["error"] = error
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        # Auditing must never make a successful review fail.
+        pass
+
+
+def _redact_audit_text(value: str) -> str:
+    """Remove common personal/contact identifiers before writing review logs."""
+    value = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[EMAIL]", value)
+    value = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[PHONE]", value)
+    value = re.sub(r"(?<!\d)\d{17}[0-9Xx](?!\d)", "[ID]", value)
+    return value
+
+
+def _finalize_review(
+    review: ReviewResponse,
+    contract_text: str,
+    duration_ms: int,
+    selected_scope: list[str] | None = None,
+) -> ReviewResponse:
+    review = _validate_contract_anchors(review, contract_text)
+    allowed_scope = ([PREFLIGHT_SCOPE] if selected_scope is None or PREFLIGHT_SCOPE in selected_scope else []) + [
+        topic.name for topic in RULE_TOPICS
+        if selected_scope is None or topic.name in selected_scope
+    ]
+    allowed_scope_set = set(allowed_scope)
+    if selected_scope is not None:
+        review.risks = [risk for risk in review.risks if risk.item in allowed_scope_set]
+    fallback_risks, rule_coverage = run_rule_fallback(contract_text, allowed_scope)
+    existing_topics = {risk.item.strip() for risk in review.risks}
+    for fallback_risk in fallback_risks:
+        if fallback_risk.item not in existing_topics:
+            review.risks.append(fallback_risk)
+
+    model_coverage = {item.topic: item for item in review.coverage}
+    merged_coverage = []
+    coverage_conflicts = []
+    for item in rule_coverage:
+        model_item = model_coverage.get(item.topic)
+        if model_item and model_item.status != item.status:
+            coverage_conflicts.append(
+                f"{item.topic}（模型：{model_item.status}，规则：{item.status}）"
+            )
+        if model_item and model_item.status == "checked" and item.status == "checked":
+            item.status = "checked"
+            item.method = "combined"
+            item.evidence = model_item.evidence or item.evidence
+        elif model_item and model_item.status == "uncertain":
+            item.status = "uncertain"
+            item.method = "combined"
+            item.evidence = model_item.evidence or item.evidence
+        merged_coverage.append(item)
+
+    warnings = list(review.warnings)
+    if coverage_conflicts:
+        warnings.append(
+            "模型审查与规则检查存在冲突，已要求人工复核：" + "；".join(coverage_conflicts)
+        )
+    has_model_summary = bool(review.review_summary.strip())
+    summary = review.review_summary.strip()
+    if not has_model_summary:
+        summary = "模型未提供可验证的审查说明；空风险列表不等同于合同无风险。"
+        warnings.append("模型未返回审查说明，需由法务人员复核审查覆盖范围。")
+    if not review.risks and not all(item.status == "checked" for item in merged_coverage):
+        warnings.append("关键条款存在未检出或不确定项，系统未将本次结果判定为无风险。")
+
+    review.contract_text = contract_text
+    review.review_scope = allowed_scope
+    review.coverage = merged_coverage
+    review.preflight_checks = run_document_preflight(contract_text) if PREFLIGHT_SCOPE in allowed_scope_set else []
+    preflight_warnings = [check for check in review.preflight_checks if check.status == "warning"]
+    if preflight_warnings:
+        warnings.append(
+            f"基础质量预检发现 {len(preflight_warnings)} 项待确认内容；请先核对标点、文字和合同框架后再处理实质条款。"
+        )
+    review.review_summary = summary
+    review.warnings = list(dict.fromkeys(warnings))
+    review.consistency_checks = run_consistency_checks(contract_text, allowed_scope)
+    consistency_warnings = [
+        check for check in review.consistency_checks if check.status == "warning"
+    ]
+    if consistency_warnings:
+        review.warnings.append(
+            "合同内部一致性检查发现需人工确认项："
+            + "、".join(check.check for check in consistency_warnings)
+        )
+    review = verify_high_risk_findings(review)
+    has_evidence_warning = any(
+        "法规依据" in warning
+        or "法规引用" in warning
+        or "法律依据" in warning
+        or "原文定位" in warning
+        or "插入锚点" in warning
+        or "模型审查与规则检查存在冲突" in warning
+        or "高风险项二次复核未通过" in warning
+        for warning in review.warnings
+    )
+    review.review_status = (
+        "complete"
+        if has_model_summary and all(item.status == "checked" for item in merged_coverage) and not has_evidence_warning
+        else "partial"
+    )
+    if any(risk.evidence_status != "verified" for risk in review.risks) or consistency_warnings or preflight_warnings:
+        review.review_status = "partial"
+    # A substantive review with no findings is not equivalent to a verified
+    # risk-free contract.  It may reflect a model omission, an unsupported
+    # clause pattern, or insufficient evidence.  Keep the result usable, but
+    # require a human to confirm the review coverage instead of silently
+    # presenting a clean bill of health.
+    substantive_scope_requested = any(topic != PREFLIGHT_SCOPE for topic in allowed_scope)
+    if substantive_scope_requested and not review.risks:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            "模型未形成可验证的风险项；这不等同于合同无风险，需人工复核审查覆盖范围。",
+        ]))
+        review.review_status = "needs_manual_review"
+    review.manual_review_required = review.review_status != "complete"
+    review.review_method = "combined"
+    if not review.risks and not has_model_summary:
+        review.review_status = "needs_manual_review"
+    review.review_duration_ms = duration_ms
+    return review
+
+
+def _model_content_to_text(content: object) -> str:
+    """Normalize OpenAI-compatible message content without trusting one shape.
+
+    Hosted and local compatible gateways normally return a string, but some
+    return a list of text blocks. Treat only explicit text/content fields as
+    model output; unknown blocks are ignored instead of stringifying a Python
+    object into invalid pseudo-JSON.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    chunks: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            chunks.append(block)
+            continue
+        if isinstance(block, dict):
+            value = block.get("text", block.get("content", ""))
+        else:
+            value = getattr(block, "text", getattr(block, "content", ""))
+        if isinstance(value, str):
+            chunks.append(value)
+        elif isinstance(value, dict) and isinstance(value.get("value"), str):
+            chunks.append(value["value"])
+    return "".join(chunks)
+
+
+def _parse_json_content(content: object) -> object:
+    cleaned = _model_content_to_text(content).strip().lstrip("\ufeff").replace("\x00", "")
+    # Some local reasoning models ignore ``enable_thinking=false`` and wrap the
+    # actual response in a think block.  It is never part of the API payload.
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        return json.loads(cleaned, strict=False)
+    except json.JSONDecodeError:
+        # Tolerate a common model artefact without changing punctuation inside
+        # normal prose: a trailing comma immediately before a closing token.
+        repaired = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        try:
+            return json.loads(repaired, strict=False)
+        except json.JSONDecodeError:
+            pass
+        decoder = json.JSONDecoder(strict=False)
+        for index, char in enumerate(repaired):
+            if char not in "[{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(repaired[index:])
+                return payload
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("No valid JSON object or array was found in model output.")
+
+
 def parse_review_response(content: str, filename: str) -> ReviewResponse:
-    payload = json.loads(content)
+    payload = _parse_json_content(content)
     normalized_payload = _normalize_review_payload(payload)
     # Remove contract_text from AI payload to prevent overriding
     # the backend-set value (which comes from the actual docx extraction).
@@ -166,7 +884,88 @@ def parse_review_response(content: str, filename: str) -> ReviewResponse:
     return ReviewResponse(filename=filename, **normalized_payload)
 
 
-def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
+def _is_uninformative_model_response(review: ReviewResponse) -> bool:
+    """Treat an empty, unexplained response as unusable rather than risk-free."""
+    return not review.risks and not review.review_summary.strip()
+
+
+def _retry_review_with_compact_json(
+    *,
+    api_key: str,
+    model: str,
+    contract_text: str,
+    filename: str,
+    selected_scope: list[str],
+) -> tuple[ReviewResponse, str]:
+    """Retry the original contract with a compact schema after malformed output.
+
+    This is deliberately not a JSON "repair" prompt: severely corrupted output
+    has no dependable structure to repair. Re-reviewing the original text with
+    fewer instructions is materially more reliable on OpenAI-compatible local
+    inference services.
+    """
+    retry_client = OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("BAILIAN_BASE_URL", BAILIAN_DEFAULT_BASE_URL),
+        timeout=REVIEW_REPAIR_TIMEOUT_SECONDS,
+    )
+    excerpt = contract_text[:REVIEW_JSON_RETRY_MAX_CONTRACT_CHARS]
+    response = retry_client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a contract reviewer. Return one valid JSON object only. "
+                    "Do not use Markdown, explanations, or thinking text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Review only these topics: " + "、".join(selected_scope) + "\n"
+                    "Return exactly this shape: "
+                    '{"contract_type":"通用商务合同","review_summary":"简短审查说明",'
+                    '"risks":[{"item":"检查项","level":"high|medium|low",'
+                    '"original_text":"合同原文或【缺失该约定】","risk":"风险说明",'
+                    '"suggestion":"可直接写入合同的条款","laws":[]}]}\n'
+                    "Every risk must contain all fields. If no evidence-backed risk is found, return "
+                    '{"contract_type":"通用商务合同","review_summary":"已按所选范围审查，未形成可验证风险。",'
+                    '"risks":[]}.\n合同文本：\n' + excerpt
+                ),
+            },
+        ],
+        temperature=0,
+        max_tokens=min(int(os.getenv("BAILIAN_MAX_OUTPUT_TOKENS", "2048")), 2048),
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **_json_mode_options(),
+    )
+    content = _model_content_to_text(response.choices[0].message.content)
+    if not content:
+        raise ValueError("compact retry returned an empty response")
+    return parse_review_response(content=content, filename=filename), content
+
+
+def _review_contract_segment(
+    contract_text: str,
+    filename: str,
+    selected_scope: list[str] | None = None,
+) -> ReviewResponse:
+    model_scope_topics = [
+        topic for topic in (REVIEW_SCOPE if selected_scope is None else selected_scope)
+        if topic != PREFLIGHT_SCOPE
+    ]
+    if not model_scope_topics:
+        return ReviewResponse(
+            filename=filename,
+            risks=[],
+            review_summary="已完成基础质量与合同框架检查；未请求条款实质审查。",
+            review_scope=selected_scope or [PREFLIGHT_SCOPE],
+            review_status="complete",
+            manual_review_required=False,
+            review_method="rule",
+        )
+
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -181,16 +980,31 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
         timeout=timeout_seconds,
     )
     model = os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL)
+    started_at = perf_counter()
+    retrieval_warning = ""
     try:
-        relevant_laws = retrieve_relevant_laws(_trim_contract_text(contract_text))
+        scope_topics = model_scope_topics
+        scope_hint = "、".join(scope_topics)
+        retrieval_query = _trim_contract_text(contract_text) + f"\n本次审查范围：{scope_hint}"
+        try:
+            relevant_laws = retrieve_relevant_laws(
+                retrieval_query,
+                review_topics=scope_topics,
+            )
+        except TypeError as exc:
+            # Keep compatibility with injected/mock retrievers using the old signature.
+            if "review_topics" not in str(exc):
+                raise
+            relevant_laws = retrieve_relevant_laws(retrieval_query)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"RAG law retrieval failed: {exc}",
-        ) from exc
+        # Law retrieval is an enrichment step. The contract review should still
+        # be available when Qdrant or the embedding provider is temporarily down.
+        relevant_laws = []
+        retrieval_warning = f"法规检索失败：{exc}；本次结论需人工复核。"
 
     law_context = format_laws_for_prompt(relevant_laws)
     contract_language = _infer_contract_language(contract_text)
+    indexed_contract, paragraph_references = format_contract_with_paragraph_references(contract_text)
 
     try:
         response = client.chat.completions.create(
@@ -199,18 +1013,25 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": (
+                        "content": (
+                        f"本次仅审查以下范围：{'、'.join(scope_topics)}\n"
+                        f"review_scope 必须原样返回以上范围，不得添加未勾选项目。\n"
                         "请以 JSON 格式输出，格式必须是："
                         '{"contract_type":"采购/供应合同|销售/服务合同|保密协议|通用商务合同",'
                         '"risks":[{"item":"检查项","level":"high|medium|low",'
                         '"original_text":"合同原文中的精确原句或【缺失该约定】",'
                         '"anchor_text":"定位相关条款的邻近标题、条款号或相邻原句，可为null",'
                         '"insert_after_text":"新增条款应插入其后的合同原文锚点或null",'
+                        '"clause_reference":"P001 格式的合同段落编号",'
                         '"risk":"风险提示","suggestion":"修改建议",'
-                        '"laws":["《法规名称》第XXX条"]}]}。'
+                        '"laws":["《法规名称》第XXX条"]}],'
+                        '"review_summary":"基于合同原文的审查结论",'
+                        '"review_scope":["付款与发票","交付与验收","违约与责任","知识产权"],'
+                        '"coverage":[{"topic":"付款与发票","status":"checked|missing|uncertain","evidence":"合同原文依据"}]}'
                         "contract_type 必须是四个固定值之一，不得自由发挥。"
                         "level 只能使用 high、medium、low。"
                         "original_text 必须逐字复制合同文本中的对应内容，标点、空格和换行必须保持一致。"
+                        "合同文本中每段前的 [P001] 是定位编号；非缺失风险必须返回对应 clause_reference，original_text 中不得包含编号。"
                         "anchor_text 应优先返回相关章节标题、条款号或邻近原句。"
                         "若 original_text 为【缺失该约定】，insert_after_text 必须优先选择合同中相关章节标题或相邻条款原文。"
                         "laws 必须列出本条建议引用的法规名称及条文号。"
@@ -220,15 +1041,40 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
                         "若合同以英文为主，suggestion 必须使用英文合同条款语言；"
                         "若合同以中文为主，suggestion 必须使用中文合同条款语言；"
                         "若合同为中英混合，suggestion 必须跟随 original_text 或 insert_after_text 所在章节的语言。\n\n"
+                        "法规引用约束：laws 只能从下方参考法条中原样选择，不能凭记忆补写法规名称或条文号；如果下方没有足够依据，laws 必须返回空数组，并在 review_summary 或 warnings 中说明需人工核验。\n"
                         f"参考法条：\n{law_context}\n\n"
-                        f"合同文本：\n{_trim_contract_text(contract_text)}"
+                        f"合同文本（段落编号仅用于定位）：\n{_trim_contract_text(indexed_contract)}"
                     ),
                 },
             ],
-            response_format=_response_format(),
             temperature=0.2,
+            max_tokens=int(os.getenv("BAILIAN_MAX_OUTPUT_TOKENS", "2048")),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **_json_mode_options(),
         )
     except Exception as exc:
+        _audit_review(
+            filename=filename,
+            raw_response="",
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            status="request_failed_rule_fallback",
+            risk_count=0,
+            error=str(exc),
+        )
+        fallback_enabled = os.getenv("REVIEW_RULE_FALLBACK_ON_MODEL_ERROR", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if fallback_enabled:
+            return ReviewResponse(
+                filename=filename,
+                risks=[],
+                review_summary="模型服务当前不可连接，已完成所选审查范围的规则兜底检查；结果需要人工复核。",
+                review_scope=selected_scope or REVIEW_SCOPE,
+                warnings=[f"模型审查暂时不可用：{exc}；本次已切换为规则兜底审查。"],
+                review_status="needs_manual_review",
+            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Bailian review request failed: {exc}",
@@ -242,9 +1088,189 @@ def review_contract_text(contract_text: str, filename: str) -> ReviewResponse:
         )
 
     try:
-        return parse_review_response(content=content, filename=filename)
+        parsed = parse_review_response(content=content, filename=filename)
+        parsed = hydrate_review_clause_references(parsed, paragraph_references)
+        if _is_uninformative_model_response(parsed):
+            raise ValueError("model returned an empty risks list without a review summary")
+        if retrieval_warning:
+            parsed.warnings.append(retrieval_warning)
+        parsed = _validate_law_evidence(parsed, relevant_laws)
+        _audit_review(
+            filename=filename,
+            raw_response=content,
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            status="model_response",
+            risk_count=len(parsed.risks),
+        )
+        return parsed
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Bailian returned an invalid review payload: {exc}",
-        ) from exc
+        repaired_content = ""
+        try:
+            parsed, repaired_content = _retry_review_with_compact_json(
+                api_key=api_key,
+                model=model,
+                contract_text=contract_text,
+                filename=filename,
+                selected_scope=scope_topics,
+            )
+            if retrieval_warning:
+                parsed.warnings.append(retrieval_warning)
+            parsed = _validate_law_evidence(parsed, relevant_laws)
+            _audit_review(
+                filename=filename,
+                raw_response=content + "\n[repaired]\n" + repaired_content,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+                status="compact_retry_response",
+                risk_count=len(parsed.risks),
+            )
+            return parsed
+        except Exception as repair_exc:
+            _audit_review(
+                filename=filename,
+                raw_response=content + "\n[repair_failed]\n" + repaired_content,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+                status="invalid_response_no_json" if "No valid JSON" in str(exc) else "invalid_response",
+                risk_count=0,
+                error=f"initial={exc}; repair={repair_exc}",
+            )
+            # Do not turn a malformed model response into a user-facing 500.
+            # _finalize_review will add deterministic rule findings and mark the
+            # result as partial/needs_manual_review.
+            return ReviewResponse(
+                filename=filename,
+                risks=[],
+                warnings=["模型返回的数据结构不完整，已启用规则兜底并要求人工复核。"],
+            )
+
+
+def _split_contract_text(contract_text: str) -> list[str]:
+    """Split on paragraph boundaries while keeping each model request bounded."""
+    target = max(1000, REVIEW_SEGMENT_CHARS)
+    paragraphs = contract_text.splitlines(keepends=True)
+    segments: list[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > target:
+            if current:
+                segments.append(current)
+                current = ""
+            for start in range(0, len(paragraph), target):
+                segments.append(paragraph[start : start + target])
+            continue
+
+        if current and len(current) + len(paragraph) > target:
+            segments.append(current)
+            current = ""
+        current += paragraph
+
+    if current:
+        segments.append(current)
+    return segments or [contract_text]
+
+
+def review_contract_text(
+    contract_text: str,
+    filename: str,
+    selected_scope: list[str] | None = None,
+) -> ReviewResponse:
+    """Review every contract segment and merge risks back into one response."""
+    started_at = perf_counter()
+    if selected_scope is not None and not [topic for topic in selected_scope if topic != PREFLIGHT_SCOPE]:
+        return _finalize_review(
+            ReviewResponse(
+                filename=filename,
+                risks=[],
+                review_summary="已完成基础质量与合同框架检查；未请求条款实质审查。",
+                review_scope=selected_scope,
+                review_status="complete",
+                manual_review_required=False,
+                review_method="rule",
+            ),
+            contract_text,
+            round((perf_counter() - started_at) * 1000),
+            selected_scope,
+        )
+    segments = _split_contract_text(contract_text)
+    if len(segments) == 1:
+        return _finalize_review(
+            _review_contract_segment(contract_text, filename, selected_scope),
+            contract_text,
+            round((perf_counter() - started_at) * 1000),
+            selected_scope,
+        )
+
+    worker_count = min(3, len(segments))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="contract-review") as executor:
+        if selected_scope is None:
+            segment_reviews = list(executor.map(
+                lambda segment: _review_contract_segment(segment, filename),
+                segments,
+            ))
+        else:
+            segment_reviews = list(executor.map(
+                lambda segment: _review_contract_segment(segment, filename, selected_scope),
+                segments,
+            ))
+    merged_risks = []
+    risk_index: dict[tuple[str, str], int] = {}
+    merged_warnings: list[str] = []
+    segment_coverage: dict[str, ReviewCoverage] = {}
+    level_rank = {"high": 0, "medium": 1, "low": 2}
+
+    def normalize_key(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    for segment_review in segment_reviews:
+        merged_warnings.extend(segment_review.warnings)
+        for coverage in segment_review.coverage:
+            current = segment_coverage.get(coverage.topic)
+            if current is None:
+                segment_coverage[coverage.topic] = coverage
+            elif coverage.status != "checked":
+                segment_coverage[coverage.topic] = coverage
+        for risk in segment_review.risks:
+            key = (
+                normalize_key(risk.item),
+                normalize_key(risk.original_text),
+            )
+            existing_index = risk_index.get(key)
+            if existing_index is None:
+                risk_index[key] = len(merged_risks)
+                merged_risks.append(risk)
+                continue
+
+            existing = merged_risks[existing_index]
+            if level_rank[risk.level] < level_rank[existing.level]:
+                existing.level = risk.level
+            existing.laws = list(dict.fromkeys(existing.laws + risk.laws))
+            for reference in risk.law_references:
+                if reference not in existing.law_references:
+                    existing.law_references.append(reference)
+            if risk.evidence_status == "verified":
+                existing.evidence_status = "verified"
+            if risk.source != existing.source:
+                existing.source = "combined"
+            if len(risk.suggestion) > len(existing.suggestion):
+                existing.suggestion = risk.suggestion
+            existing.anchor_text = existing.anchor_text or risk.anchor_text
+            existing.insert_after_text = existing.insert_after_text or risk.insert_after_text
+
+    contract_type = next(
+        (review.contract_type for review in segment_reviews if review.contract_type),
+        None,
+    )
+    merged = ReviewResponse(
+        filename=filename,
+        contract_type=contract_type,
+        contract_text=contract_text,
+        risks=merged_risks,
+        warnings=list(dict.fromkeys(merged_warnings)),
+        coverage=list(segment_coverage.values()),
+    )
+    return _finalize_review(
+        merged,
+        contract_text,
+        round((perf_counter() - started_at) * 1000),
+        selected_scope,
+    )
