@@ -63,6 +63,15 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The export view uses these response headers to report how many requested
+    # redlines were safely written.  Exposing them keeps the UI accurate even
+    # when it is served from an allowed development origin instead of the API
+    # origin itself.
+    expose_headers=[
+        "X-Review-Requested-Modifications",
+        "X-Review-Applied-Modifications",
+        "X-Review-Skipped-Modifications",
+    ],
 )
 
 

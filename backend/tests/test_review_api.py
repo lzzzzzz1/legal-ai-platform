@@ -85,6 +85,8 @@ def test_intake_chat_returns_modelled_review_criteria(monkeypatch) -> None:
         assert "甲方" in request.contract_text
         return IntakeChatResponse(
             assistant_message="请说明本次交易最想达成的业务结果。",
+            quick_replies=["确保按期上线。", "控制付款风险。"],
+            suggested_questions=["合同目前怎样约定验收？"],
             criteria={"party_role": "party_a", "business_context": "采购方希望按期上线"},
             ready_for_review=True,
             source="model",
@@ -104,6 +106,8 @@ def test_intake_chat_returns_modelled_review_criteria(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["criteria"]["party_role"] == "party_a"
     assert response.json()["source"] == "model"
+    assert response.json()["quick_replies"] == ["确保按期上线。", "控制付款风险。"]
+    assert response.json()["suggested_questions"] == ["合同目前怎样约定验收？"]
 
 
 def test_review_returns_structured_payload(monkeypatch) -> None:

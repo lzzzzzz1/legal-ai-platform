@@ -106,7 +106,7 @@ def _trim_contract_text(contract_text: str) -> str:
 
     return (
         contract_text[:MAX_CONTRACT_CHARS]
-        + "\n\n[合同文本过长，已截取前 60000 个字符用于本次 MVP 审查。]"
+        + f"\n\n[合同文本过长，已截取前 {MAX_CONTRACT_CHARS} 个字符用于本次审查。]"
     )
 
 
@@ -288,7 +288,7 @@ def recover_unreferenced_risk_locations(
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             **_json_mode_options(),
         )
-        payload = _parse_json_content(response.choices[0].message.content or "")
+        payload = _parse_json_content(response.choices[0].message.content)
         matches = payload.get("matches", []) if isinstance(payload, dict) else []
         recovered = 0
         if isinstance(matches, list):
@@ -380,7 +380,7 @@ def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contr
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             **_json_mode_options(),
         )
-        payload = _parse_json_content(response.choices[0].message.content or "")
+        payload = _parse_json_content(response.choices[0].message.content)
         matches = payload.get("matches", []) if isinstance(payload, dict) else []
         repaired = 0
         repaired_indexes: set[int] = set()
@@ -758,7 +758,7 @@ def _finalize_review(
     review.preflight_checks = run_document_preflight(contract_text) if PREFLIGHT_SCOPE in allowed_scope_set else []
     preflight_warnings = [check for check in review.preflight_checks if check.status == "warning"]
     if preflight_warnings:
-        review.warnings.append(
+        warnings.append(
             f"基础质量预检发现 {len(preflight_warnings)} 项待确认内容；请先核对标点、文字和合同框架后再处理实质条款。"
         )
     review.review_summary = summary
@@ -790,6 +790,18 @@ def _finalize_review(
     )
     if any(risk.evidence_status != "verified" for risk in review.risks) or consistency_warnings or preflight_warnings:
         review.review_status = "partial"
+    # A substantive review with no findings is not equivalent to a verified
+    # risk-free contract.  It may reflect a model omission, an unsupported
+    # clause pattern, or insufficient evidence.  Keep the result usable, but
+    # require a human to confirm the review coverage instead of silently
+    # presenting a clean bill of health.
+    substantive_scope_requested = any(topic != PREFLIGHT_SCOPE for topic in allowed_scope)
+    if substantive_scope_requested and not review.risks:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            "模型未形成可验证的风险项；这不等同于合同无风险，需人工复核审查覆盖范围。",
+        ]))
+        review.review_status = "needs_manual_review"
     review.manual_review_required = review.review_status != "complete"
     review.review_method = "combined"
     if not review.risks and not has_model_summary:
@@ -798,8 +810,40 @@ def _finalize_review(
     return review
 
 
-def _parse_json_content(content: str) -> object:
-    cleaned = content.strip().lstrip("\ufeff")
+def _model_content_to_text(content: object) -> str:
+    """Normalize OpenAI-compatible message content without trusting one shape.
+
+    Hosted and local compatible gateways normally return a string, but some
+    return a list of text blocks. Treat only explicit text/content fields as
+    model output; unknown blocks are ignored instead of stringifying a Python
+    object into invalid pseudo-JSON.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    chunks: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            chunks.append(block)
+            continue
+        if isinstance(block, dict):
+            value = block.get("text", block.get("content", ""))
+        else:
+            value = getattr(block, "text", getattr(block, "content", ""))
+        if isinstance(value, str):
+            chunks.append(value)
+        elif isinstance(value, dict) and isinstance(value.get("value"), str):
+            chunks.append(value["value"])
+    return "".join(chunks)
+
+
+def _parse_json_content(content: object) -> object:
+    cleaned = _model_content_to_text(content).strip().lstrip("\ufeff").replace("\x00", "")
+    # Some local reasoning models ignore ``enable_thinking=false`` and wrap the
+    # actual response in a think block.  It is never part of the API payload.
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
         if lines and lines[0].strip().startswith("```"):
@@ -809,14 +853,21 @@ def _parse_json_content(content: str) -> object:
         cleaned = "\n".join(lines).strip()
 
     try:
-        return json.loads(cleaned)
+        return json.loads(cleaned, strict=False)
     except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        for index, char in enumerate(cleaned):
+        # Tolerate a common model artefact without changing punctuation inside
+        # normal prose: a trailing comma immediately before a closing token.
+        repaired = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        try:
+            return json.loads(repaired, strict=False)
+        except json.JSONDecodeError:
+            pass
+        decoder = json.JSONDecoder(strict=False)
+        for index, char in enumerate(repaired):
             if char not in "[{":
                 continue
             try:
-                payload, _ = decoder.raw_decode(cleaned[index:])
+                payload, _ = decoder.raw_decode(repaired[index:])
                 return payload
             except json.JSONDecodeError:
                 continue
@@ -889,7 +940,7 @@ def _retry_review_with_compact_json(
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **_json_mode_options(),
     )
-    content = response.choices[0].message.content or ""
+    content = _model_content_to_text(response.choices[0].message.content)
     if not content:
         raise ValueError("compact retry returned an empty response")
     return parse_review_response(content=content, filename=filename), content

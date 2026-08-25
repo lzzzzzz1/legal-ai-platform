@@ -58,6 +58,15 @@ def test_parse_review_response_extracts_json_from_model_prose() -> None:
     assert response.risks == []
 
 
+def test_json_parser_supports_openai_compatible_text_blocks() -> None:
+    payload = openai_review._parse_json_content([
+        {"type": "text", "text": '{"review_summary":"已完成审查",'},
+        {"type": "text", "text": '"risks":[]}'},
+    ])
+
+    assert payload == {"review_summary": "已完成审查", "risks": []}
+
+
 def test_finalize_marks_unlocatable_model_quote_for_manual_review() -> None:
     review = ReviewResponse(
         filename="contract.docx",
@@ -92,6 +101,37 @@ def test_finalize_surfaces_model_rule_coverage_conflict() -> None:
 
     assert finalized.review_status == "partial"
     assert any("模型审查与规则检查存在冲突" in warning for warning in finalized.warnings)
+
+
+def test_finalize_keeps_preflight_warning_and_requires_review_for_empty_substantive_result(monkeypatch) -> None:
+    monkeypatch.setattr(
+        openai_review,
+        "run_rule_fallback",
+        lambda _text, scope: (
+            [],
+            [ReviewCoverage(topic=topic, status="checked", evidence="规则已检查") for topic in scope],
+        ),
+    )
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[],
+        review_summary="已完成本次审查。",
+        coverage=[
+            ReviewCoverage(topic=topic.name, status="checked", evidence="规则已检查")
+            for topic in openai_review.RULE_TOPICS
+        ],
+    )
+
+    finalized = openai_review._finalize_review(
+        review,
+        "甲方与乙方约定合作；合同标题。",
+        10,
+    )
+
+    assert any("基础质量预检发现" in warning for warning in finalized.warnings)
+    assert any("不等同于合同无风险" in warning for warning in finalized.warnings)
+    assert finalized.review_status == "needs_manual_review"
+    assert finalized.manual_review_required is True
 
 
 def test_unmatched_law_citations_are_removed_from_usable_result() -> None:

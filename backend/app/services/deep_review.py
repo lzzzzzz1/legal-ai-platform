@@ -15,6 +15,7 @@ from app.services.openai_review import (
     BAILIAN_DEFAULT_MODEL,
     _audit_review,
     _json_mode_options,
+    _model_content_to_text,
     _parse_json_content,
     _normalize_risk_fields,
     _trim_contract_text,
@@ -111,7 +112,7 @@ def review_contract_deeply(
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             **_json_mode_options(),
         )
-        content = response.choices[0].message.content or ""
+        content = _model_content_to_text(response.choices[0].message.content)
         if not content:
             raise ValueError("Deep review model returned an empty response.")
     except HTTPException:

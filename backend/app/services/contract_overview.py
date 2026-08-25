@@ -132,7 +132,7 @@ def _request_overview_payload(client: OpenAI, contract_text: str, prompt: str) -
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **_json_mode_options(),
     )
-    return _parse_json_content(response.choices[0].message.content or "")
+    return _parse_json_content(response.choices[0].message.content)
 
 
 def create_contract_overview(contract_text: str) -> ContractOverview:

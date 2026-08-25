@@ -19,6 +19,7 @@ W_R = f"{{{W_NS}}}r"
 W_T = f"{{{W_NS}}}t"
 W_DEL_TEXT = f"{{{W_NS}}}delText"
 W_PPR = f"{{{W_NS}}}pPr"
+W_RPR = f"{{{W_NS}}}rPr"
 W_NUMPR = f"{{{W_NS}}}numPr"
 W_NUMID = f"{{{W_NS}}}numId"
 W_INS = f"{{{W_NS}}}ins"
@@ -52,9 +53,9 @@ def parse_modifications(modifications_json: str) -> list[Modification]:
     if len(payload) > MAX_MODIFICATIONS:
         raise ValueError(f"at most {MAX_MODIFICATIONS} modifications are allowed")
 
-    seen_originals: dict[str, str] = {}
+    seen_originals: dict[tuple[str, str | None], str] = {}
     unique_modifications: list[Modification] = []
-    seen_entries: set[tuple[str, str, str | None]] = set()
+    seen_entries: set[tuple[str, str, str | None, str | None]] = set()
     for item in payload:
         if not isinstance(item, dict):
             raise ValueError("each modification must be an object")
@@ -65,19 +66,20 @@ def parse_modifications(modifications_json: str) -> list[Modification]:
         paragraph_context = _modification_context(item)
         if paragraph_context and len(paragraph_context) > MAX_MODIFICATION_TEXT_CHARS:
             raise ValueError("each paragraph context must be 20000 characters or shorter")
-        entry_key = (original, modified, anchor)
+        entry_key = (original, modified, anchor, paragraph_context)
         if entry_key in seen_entries:
             continue
         seen_entries.add(entry_key)
 
         # Multiple missing clauses legitimately share the sentinel and may be
         # inserted at different anchors.  Only real source text must have one
-        # unambiguous replacement.
+        # unambiguous replacement inside the same source paragraph.
         if not _is_missing_sentinel(original):
-            previous = seen_originals.get(original)
+            source_key = (original, paragraph_context)
+            previous = seen_originals.get(source_key)
             if previous is not None and previous != modified:
                 raise ValueError("the same original text cannot have conflicting replacements")
-            seen_originals[original] = modified
+            seen_originals[source_key] = modified
         unique_modifications.append(item)
 
     if not unique_modifications:
@@ -97,8 +99,10 @@ def _modification_texts(modification: Modification) -> tuple[str, str]:
     if not isinstance(original, str) or not original:
         raise ValueError("each modification requires a non-empty original text")
 
-    if not isinstance(modified, str) or not modified:
-        raise ValueError("each modification requires a non-empty modified text")
+    if not isinstance(modified, str):
+        raise ValueError("each modification requires a string modified text")
+    if _is_missing_sentinel(original) and not modified.strip():
+        raise ValueError("a missing-clause insertion requires non-empty modified text")
 
     return original, modified
 
@@ -206,6 +210,43 @@ def _replace_with_revision(paragraph: etree._Element, original: str, modified: s
 def _mark_inserted_paragraph(paragraph: etree._Element, modified: str, revision_id: int) -> None:
     _clear_paragraph_runs(paragraph)
     paragraph.append(_make_revision_container(W_INS, modified, revision_id))
+
+
+def _mark_deleted_paragraph(paragraph: etree._Element, revision_id: int) -> bool:
+    """Mark one complete source paragraph as a real Word deletion.
+
+    Word requires both a deleted paragraph mark in ``w:pPr/w:rPr`` and deleted
+    run text.  The former lets Word remove the paragraph when the reviewer
+    accepts the change; the latter keeps the text visible as a redline while
+    it is still under review.
+    """
+    paragraph_text = _paragraph_text(paragraph)
+    if not paragraph_text:
+        return False
+
+    paragraph_properties = paragraph.find(W_PPR)
+    if paragraph_properties is None:
+        paragraph_properties = etree.Element(W_PPR)
+        paragraph.insert(0, paragraph_properties)
+    run_properties = paragraph_properties.find(W_RPR)
+    if run_properties is None:
+        run_properties = etree.SubElement(paragraph_properties, W_RPR)
+    paragraph_delete = etree.SubElement(run_properties, W_DEL)
+    paragraph_delete.set(W_ID, str(revision_id))
+    paragraph_delete.set(W_AUTHOR, "Legal AI")
+    paragraph_delete.set(W_DATE, _current_revision_date())
+
+    _clear_paragraph_runs(paragraph)
+    paragraph.append(_make_revision_container(W_DEL, paragraph_text, revision_id + 1))
+    return True
+
+
+def _delete_paragraph_fully(paragraph: etree._Element) -> bool:
+    parent = paragraph.getparent()
+    if parent is None:
+        return False
+    parent.remove(paragraph)
+    return True
 
 
 def _replace_with_final_text(paragraph: etree._Element, original: str, modified: str) -> bool:
@@ -351,6 +392,18 @@ def _remove_track_revisions(settings_xml: bytes) -> bytes:
 
 def _accept_existing_revisions(root: etree._Element) -> None:
     """Flatten revisions already present in an uploaded DOCX for final export."""
+    # A deleted paragraph is represented by a revision marker on the paragraph
+    # mark itself.  Remove the whole paragraph before flattening deleted runs,
+    # otherwise accepting the revision would leave an empty blank paragraph.
+    deleted_paragraphs = [
+        paragraph
+        for paragraph in root.iter(W_P)
+        if (paragraph.find(W_PPR) is not None and paragraph.find(W_PPR).find(W_RPR) is not None
+            and paragraph.find(W_PPR).find(W_RPR).find(W_DEL) is not None)
+    ]
+    for paragraph in deleted_paragraphs:
+        _delete_paragraph_fully(paragraph)
+
     for deleted in list(root.iter(W_DEL)):
         parent = deleted.getparent()
         if parent is not None:
@@ -388,7 +441,8 @@ def _replace_many_with_revisions(
         if start > cursor:
             paragraph.append(_make_run(paragraph_text[cursor:start]))
         paragraph.append(_make_revision_container(W_DEL, original, revision_id))
-        paragraph.append(_make_revision_container(W_INS, modified, revision_id + 1))
+        if modified:
+            paragraph.append(_make_revision_container(W_INS, modified, revision_id + 1))
         cursor = end
     if cursor < len(paragraph_text):
         paragraph.append(_make_run(paragraph_text[cursor:]))
@@ -412,9 +466,13 @@ def _modify_xml_story(
         # Insertions do not rewrite existing text.  Apply them first so a later
         # replacement cannot make an otherwise valid anchor disappear.
         remaining_replacements: list[tuple[str, str, str | None, str | None]] = []
+        paragraph_deletions: list[tuple[str, str, str | None, str | None]] = []
         for original, modified, anchor, paragraph_context in modifications:
             if not _is_missing_sentinel(original):
-                remaining_replacements.append((original, modified, anchor, paragraph_context))
+                if modified:
+                    remaining_replacements.append((original, modified, anchor, paragraph_context))
+                else:
+                    paragraph_deletions.append((original, modified, anchor, paragraph_context))
                 continue
             inserted = _insert_after_ooxml_paragraph(root, anchor, modified, revision_id) if anchor else False
             if not inserted and not anchor:
@@ -422,6 +480,23 @@ def _modify_xml_story(
             applied += int(inserted)
             if inserted:
                 revision_id += 1
+
+        inline_deletions: list[tuple[str, str, str | None, str | None]] = []
+        for original, modified, anchor, paragraph_context in paragraph_deletions:
+            if paragraph_context and original != paragraph_context:
+                inline_deletions.append((original, modified, anchor, paragraph_context))
+                continue
+            matches = [
+                paragraph
+                for paragraph in root.iter(W_P)
+                if _paragraph_text(paragraph) == original
+                and (not paragraph_context or _paragraph_text(paragraph) == paragraph_context)
+            ]
+            if len(matches) == 1 and _mark_deleted_paragraph(matches[0], revision_id):
+                applied += 1
+                revision_id += 2
+
+        remaining_replacements.extend(inline_deletions)
 
         # Match all exact replacements against each paragraph before changing
         # it. This preserves distinct Word revision records within a clause.
@@ -451,16 +526,18 @@ def _modify_xml_story(
             selected: list[tuple[int, int, str, str, int]] = []
             selected_indexes: set[int] = set()
             occupied_until = 0
+            next_revision_id = revision_id
             for start, end, modification_index, original, modified in sorted(candidates, key=lambda item: (item[0], item[1])):
                 if start < occupied_until:
                     continue
-                selected.append((start, end, original, modified, revision_id + len(selected) * 2))
+                selected.append((start, end, original, modified, next_revision_id))
                 selected_indexes.add(modification_index)
                 occupied_until = end
+                next_revision_id += 2 if modified else 1
             if not selected:
                 continue
             applied += _replace_many_with_revisions(paragraph, selected)
-            revision_id += len(selected) * 2
+            revision_id = next_revision_id
             unmatched = [item for item in unmatched if item[0] not in selected_indexes]
 
         return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), applied, revision_id
@@ -481,6 +558,25 @@ def _modify_xml_story(
             applied += int(inserted)
             if inserted:
                 revision_id += 1
+            continue
+
+        if not modified:
+            matches = [
+                paragraph
+                for paragraph in root.iter(W_P)
+                if (not paragraph_context or _paragraph_text(paragraph) == paragraph_context)
+                and original in _paragraph_text(paragraph)
+            ]
+            if len(matches) != 1:
+                applied += 0
+                continue
+            paragraph = matches[0]
+            matched = (
+                _delete_paragraph_fully(paragraph)
+                if _paragraph_text(paragraph) == original
+                else _replace_with_final_text(paragraph, original, "")
+            )
+            applied += int(matched)
             continue
 
         matches = [

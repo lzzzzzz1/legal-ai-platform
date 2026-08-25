@@ -133,6 +133,130 @@ def test_tracked_export_preserves_multiple_revisions_in_one_paragraph() -> None:
     assert "由乙方确定" in deleted_text
 
 
+def test_tracked_export_supports_whole_paragraph_deletion() -> None:
+    document = Document()
+    document.add_paragraph("第一段保留。")
+    document.add_paragraph("第二段需要删除。")
+    document.add_paragraph("第三段保留。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={"modifications": json.dumps([{"original": "第二段需要删除。", "modified": ""}], ensure_ascii=False)},
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    settings_xml = _read_docx_xml(response.content, "word/settings.xml")
+    assert document_xml.xpath(".//w:p[w:pPr/w:rPr/w:del]", namespaces=W_NS)
+    deleted_text = "".join(document_xml.xpath(".//w:del//w:delText/text()", namespaces=W_NS))
+    assert "第二段需要删除。" in deleted_text
+    assert settings_xml.find(".//w:trackRevisions", W_NS) is not None
+
+
+def test_final_export_removes_a_whole_deleted_paragraph() -> None:
+    document = Document()
+    document.add_paragraph("第一段保留。")
+    document.add_paragraph("第二段需要删除。")
+    document.add_paragraph("第三段保留。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps([{"original": "第二段需要删除。", "modified": ""}], ensure_ascii=False),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    text = "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+    assert "第二段需要删除。" not in text
+    assert "第一段保留。" in text
+    assert "第三段保留。" in text
+
+
+def test_tracked_export_supports_precise_sentence_deletion() -> None:
+    document = Document()
+    document.add_paragraph("付款安排：验收后支付，保留付款期限。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps(
+                [{
+                    "original": "验收后支付",
+                    "modified": "",
+                    "paragraph_context": "付款安排：验收后支付，保留付款期限。",
+                }],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    deleted_text = "".join(document_xml.xpath(".//w:del//w:delText/text()", namespaces=W_NS))
+    visible_text = "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+    assert deleted_text == "验收后支付"
+    assert "付款安排：" in visible_text
+    assert "保留付款期限。" in visible_text
+    assert "验收后支付" not in visible_text
+
+
+def test_final_export_supports_precise_sentence_deletion() -> None:
+    document = Document()
+    document.add_paragraph("付款安排：验收后支付，保留付款期限。")
+    buffer = BytesIO()
+    document.save(buffer)
+
+    response = client.post(
+        "/api/export",
+        files={
+            "file": (
+                "contract.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={
+            "modifications": json.dumps([{"original": "验收后支付", "modified": "", "paragraph_context": "付款安排：验收后支付，保留付款期限。"}], ensure_ascii=False),
+            "export_mode": "final",
+        },
+    )
+
+    assert response.status_code == 200
+    document_xml = _read_docx_xml(response.content, "word/document.xml")
+    text = "".join(document_xml.xpath(".//w:t/text()", namespaces=W_NS))
+    assert text == "付款安排：，保留付款期限。"
+
+
 def test_export_rejects_fuzzy_replacement_to_preserve_precise_location() -> None:
     modifications = [
         {

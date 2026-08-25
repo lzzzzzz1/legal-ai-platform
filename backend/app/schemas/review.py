@@ -147,6 +147,8 @@ class IntakeChatRequest(BaseModel):
 
 class IntakeChatResponse(BaseModel):
     assistant_message: str = Field(min_length=1, max_length=2_000)
+    quick_replies: list[str] = Field(default_factory=list, max_length=4)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=4)
     criteria: IntakeReviewCriteria = Field(default_factory=IntakeReviewCriteria)
     ready_for_review: bool = False
     source: Literal["model", "fallback"] = "fallback"

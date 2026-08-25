@@ -129,6 +129,8 @@ type ContractOverviewResponse = {
 type IntakeChatMessage = {
   role: "assistant" | "user";
   content: string;
+  quick_replies?: string[];
+  suggested_questions?: string[];
 };
 
 type IntakeReviewCriteria = {
@@ -145,6 +147,8 @@ type IntakeReviewCriteria = {
 
 type IntakeChatResponse = {
   assistant_message: string;
+  quick_replies: string[];
+  suggested_questions: string[];
   criteria: IntakeReviewCriteria;
   ready_for_review: boolean;
   source: "model" | "fallback";
@@ -169,14 +173,6 @@ type ReviewResponse = {
   document_quality?: DocumentQuality | null;
   preflight_checks?: DocumentPreflightCheck[];
   deep_review?: DeepReviewOutput | null;
-};
-
-type SystemStatus = {
-  status: string;
-  review_model: { configured: boolean; endpoint_configured: boolean; model?: string | null; host?: string | null };
-  knowledge_base: { configured: boolean; endpoint_configured: boolean; collection?: string | null; host?: string | null };
-  pdf_parser: { endpoint_configured: boolean; host?: string | null };
-  reranker: { enabled: boolean; endpoint_configured: boolean; host?: string | null };
 };
 
 type Modification = {
@@ -491,6 +487,39 @@ function textToEditorHtml(text: string) {
   return paragraphsToEditorHtml(textToParagraphs(text.replace(unsupportedEditorCharacters, "")));
 }
 
+function buildPreciseParagraphModification(original: string, edited: string): Modification {
+  let prefixLength = 0;
+  const sharedLength = Math.min(original.length, edited.length);
+  while (prefixLength < sharedLength && original[prefixLength] === edited[prefixLength]) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < original.length - prefixLength
+    && suffixLength < edited.length - prefixLength
+    && original[original.length - suffixLength - 1] === edited[edited.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+
+  const changedOriginal = original.slice(prefixLength, original.length - suffixLength);
+  const changedEdited = edited.slice(prefixLength, edited.length - suffixLength);
+
+  // A pure insertion has no source text that the DOCX exporter can safely
+  // anchor as a run-level revision. Keep the existing paragraph-replacement
+  // representation for that narrow case. Deletes and replacements retain the
+  // smallest exact source span, so Word shows readable local redlines.
+  if (!changedOriginal) {
+    return { original, modified: edited, paragraph_context: original };
+  }
+  return {
+    original: changedOriginal,
+    modified: changedEdited,
+    paragraph_context: original,
+  };
+}
+
 function buildEditorModifications(originalText: string, editedText: string): Modification[] {
   const originalParagraphs = textToParagraphs(originalText);
   const editedParagraphs = textToParagraphs(editedText);
@@ -517,7 +546,7 @@ function buildEditorModifications(originalText: string, editedText: string): Mod
       });
       editedIndex += 1;
     } else if (original !== undefined && edited !== undefined) {
-      modifications.push({ original, modified: edited, paragraph_context: original });
+      modifications.push(buildPreciseParagraphModification(original, edited));
       originalIndex += 1;
       editedIndex += 1;
     } else if (original !== undefined) {
@@ -986,7 +1015,7 @@ async function continueIntakeChat(
     body: JSON.stringify({
       contract_text: overview.contract_text,
       overview: overview.overview,
-      messages,
+      messages: messages.map(({ role, content }) => ({ role, content })),
       criteria
     })
   });
@@ -1000,6 +1029,12 @@ async function continueIntakeChat(
   }
   return {
     assistant_message: payload.assistant_message.trim(),
+    quick_replies: Array.isArray(payload.quick_replies)
+      ? payload.quick_replies.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
+      : [],
+    suggested_questions: Array.isArray(payload.suggested_questions)
+      ? payload.suggested_questions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
+      : [],
     criteria: normalizeIntakeCriteria(payload.criteria),
     ready_for_review: payload.ready_for_review === true,
     source: payload.source === "model" ? "model" : "fallback",
@@ -1215,12 +1250,6 @@ function normalizeReviewResponse(payload: unknown, fallbackFilename: string): Re
   };
 }
 
-async function fetchSystemStatus(): Promise<SystemStatus> {
-  const response = await fetch("/api/system-status", { headers: apiHeaders() });
-  if (!response.ok) throw new Error("系统状态暂时不可获取。");
-  return response.json() as Promise<SystemStatus>;
-}
-
 async function exportReviewedContract(file: File, modifications: Modification[]) {
   const formData = new FormData();
   formData.append("file", file);
@@ -1286,6 +1315,7 @@ export default function App() {
   const riskCardRefs = useRef<Record<string, HTMLElement | null>>({});
   const pendingRevisionHtmlRef = useRef<string | null>(null);
   const readerPanelRef = useRef<HTMLElement | null>(null);
+  const intakeTimelineRef = useRef<HTMLDivElement | null>(null);
 
   const [file, setFile] = useState<File | null>(null);
   const [review, setReview] = useState<ReviewResponse | null>(null);
@@ -1328,11 +1358,12 @@ export default function App() {
   const [additionalNoteDraft, setAdditionalNoteDraft] = useState("");
   const [intakeConversationStep, setIntakeConversationStep] = useState<IntakeConversationStep>("role");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [isSystemStatusOpen, setIsSystemStatusOpen] = useState(false);
-  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [systemStatusError, setSystemStatusError] = useState<string | null>(null);
   const [readerPanelHeight, setReaderPanelHeight] = useState<number | null>(null);
   const syncingEditorRef = useRef(false);
+  // Every file/reset starts a new review session.  Long-running overview,
+  // intake and deep-review calls keep the session number they started with so
+  // an older response can never overwrite a newer contract's workspace.
+  const workflowEpochRef = useRef(0);
 
   const sortedRisks = useMemo(() => {
     return [...(review?.risks ?? [])].sort((left, right) => levelOrder[left.level] - levelOrder[right.level]);
@@ -1405,17 +1436,6 @@ export default function App() {
     [modifications, risksWithKeys],
   );
 
-  const reviewProgress = useMemo(() => {
-    const coveredTopics = new Set(review?.coverage.map((item) => item.topic) ?? []);
-    const total = Math.max(review?.review_scope.length ?? 0, coveredTopics.size, 1);
-    const checked = Math.min(
-      new Set(review?.coverage.filter((item) => item.status === "checked").map((item) => item.topic) ?? []).size,
-      total,
-    );
-    const verified = sortedRisks.filter((risk) => risk.evidence_status === "verified").length;
-    return { total, checked, verified, percentage: total ? Math.round((checked / total) * 100) : 0 };
-  }, [review, sortedRisks]);
-
   const paragraphOptions = useMemo(() => normalizeParagraphs(editorText), [editorText]);
   const canSubmit = Boolean(file) && !isLoading;
   const hasEditorChanges = Boolean(review?.contract_text && editorText !== review.contract_text);
@@ -1423,20 +1443,13 @@ export default function App() {
   const totalRisks = sortedRisks.length;
 
   useEffect(() => {
-    if (!isSystemStatusOpen) return;
-    let cancelled = false;
-    setSystemStatusError(null);
-    void fetchSystemStatus()
-      .then((nextStatus) => {
-        if (!cancelled) setSystemStatus(nextStatus);
-      })
-      .catch((statusError) => {
-        if (!cancelled) setSystemStatusError(getErrorMessage(statusError));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isSystemStatusOpen]);
+    const timeline = intakeTimelineRef.current;
+    if (!timeline || review) return;
+    const frame = requestAnimationFrame(() => {
+      timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [contractOverview, file, intakeMessages, intakeReadyForReview, isIntakeChatLoading, isLoading, review]);
 
   useEffect(() => {
     const panel = readerPanelRef.current;
@@ -1641,6 +1654,7 @@ export default function App() {
   }
 
   function clearReview() {
+    workflowEpochRef.current += 1;
     setFile(null);
     setReview(null);
     setContractOverview(null);
@@ -1652,6 +1666,7 @@ export default function App() {
   }
 
   function handleFileSelection(selectedFile: File | null) {
+    workflowEpochRef.current += 1;
     setReview(null);
     setContractOverview(null);
     setError(null);
@@ -1693,21 +1708,27 @@ export default function App() {
       return;
     }
 
+    const workflowEpoch = ++workflowEpochRef.current;
+    const selectedFile = file;
     setIsLoading(true);
     setError(null);
     setReview(null);
     resetEditorState();
 
     try {
-      const overview = await getContractOverview(file);
+      const overview = await getContractOverview(selectedFile);
+      if (workflowEpochRef.current !== workflowEpoch) return;
       setContractOverview(overview);
       setReviewStage("intake");
       setEditorNotice(null);
-      await requestIntakeAssistant(overview, [], emptyIntakeCriteria);
+      await requestIntakeAssistant(overview, [], emptyIntakeCriteria, workflowEpoch);
     } catch (submitError) {
+      if (workflowEpochRef.current !== workflowEpoch) return;
       setError(getErrorMessage(submitError));
     } finally {
-      setIsLoading(false);
+      if (workflowEpochRef.current === workflowEpoch) {
+        setIsLoading(false);
+      }
     }
   }
 
@@ -2197,12 +2218,19 @@ export default function App() {
     overview: ContractOverviewResponse,
     messages: IntakeChatMessage[],
     criteria: IntakeReviewCriteria,
+    workflowEpoch = workflowEpochRef.current,
   ) {
     setIsIntakeChatLoading(true);
     setIntakeChatWarning(null);
     try {
       const response = await continueIntakeChat(overview, messages, criteria);
-      const nextMessages = [...messages, { role: "assistant" as const, content: response.assistant_message }].slice(-12);
+      if (workflowEpochRef.current !== workflowEpoch) return;
+      const nextMessages = [...messages, {
+        role: "assistant" as const,
+        content: response.assistant_message,
+        quick_replies: response.quick_replies,
+        suggested_questions: response.suggested_questions,
+      }].slice(-12);
       setIntakeMessages(nextMessages);
       setIntakeCriteria(response.criteria);
       setDeepReviewSettings(criteriaToDeepReviewSettings(response.criteria, overview.overview));
@@ -2210,22 +2238,29 @@ export default function App() {
       setIntakeChatWarning(response.warning ?? null);
       setError(null);
     } catch (chatError) {
+      if (workflowEpochRef.current !== workflowEpoch) return;
       setError(getErrorMessage(chatError));
       setIntakeChatWarning("法务助手暂时没有回应。您可以重试；合同内容和已输入的回答都会保留。");
     } finally {
-      setIsIntakeChatLoading(false);
+      if (workflowEpochRef.current === workflowEpoch) {
+        setIsIntakeChatLoading(false);
+      }
     }
   }
 
-  async function sendIntakeChatMessage(event?: FormEvent) {
-    event?.preventDefault();
+  async function submitIntakeChatAnswer(answer: string) {
     if (!contractOverview || isIntakeChatLoading) return;
-    const content = intakeChatDraft.trim();
+    const content = answer.trim();
     if (!content) return;
     const nextMessages = [...intakeMessages, { role: "user" as const, content }].slice(-12);
     setIntakeMessages(nextMessages);
     setIntakeChatDraft("");
-    await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria);
+    await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria, workflowEpochRef.current);
+  }
+
+  async function sendIntakeChatMessage(event?: FormEvent) {
+    event?.preventDefault();
+    await submitIntakeChatAnswer(intakeChatDraft);
   }
 
   async function runDeepReview() {
@@ -2239,6 +2274,7 @@ export default function App() {
       return;
     }
 
+    const workflowEpoch = workflowEpochRef.current;
     const settingsForReview: DeepReviewFormSettings = deepReviewSettings;
     setIsLoading(true);
     setError(null);
@@ -2249,6 +2285,7 @@ export default function App() {
         settingsForReview as DeepReviewSettings,
         contractOverview.document_quality ?? undefined,
       );
+      if (workflowEpochRef.current !== workflowEpoch) return;
       if (!result.deep_review || result.deep_review.state !== "completed" || !result.deep_review.executive_summary.trim()) {
         throw new Error("深度审查未返回完整的审查说明，系统未开放修改与导出。");
       }
@@ -2270,10 +2307,13 @@ export default function App() {
           : "综合审查已完成。未发现可唯一定位的自动修改；请在右侧确认候选段落后再处理建议。"
       );
     } catch (reviewError) {
+      if (workflowEpochRef.current !== workflowEpoch) return;
       setError(getErrorMessage(reviewError));
       setEditorNotice("深度审查未形成可验证结果，正文仍保持锁定；请检查模型服务后重试。");
     } finally {
-      setIsLoading(false);
+      if (workflowEpochRef.current === workflowEpoch) {
+        setIsLoading(false);
+      }
     }
   }
 
@@ -2336,11 +2376,6 @@ export default function App() {
       return;
     }
 
-    if (exportModifications.some((item) => !item.modified.trim())) {
-      setError("当前导出暂不支持直接删除整段正文。请改为保留段落并手动改写，或使用右侧建议替换该条款。");
-      return;
-    }
-
     setIsExporting(true);
     setError(null);
 
@@ -2362,97 +2397,215 @@ export default function App() {
   const currentFilename = review?.filename ?? file?.name ?? "未选择合同";
   const currentFileSize = file ? formatFileSize(file.size) : null;
 
-  return (
-    <main className="app-shell">
-      <header className="topbar" aria-label="应用状态">
-        <div className="brand-block">
-          <span className="brand-mark" aria-hidden="true">
-            LA
-          </span>
-          <div>
-            <strong>Legal AI</strong>
-            <span>企业合同审阅工作台</span>
-          </div>
-        </div>
-        <div className="topbar-session" aria-label="当前工作区">
-          <span className="topbar-session-dot" aria-hidden="true" />
-          <span>合同审查会话</span>
-          <small>{review ? "修订工作台" : contractOverview ? "需求确认中" : "新建审查"}</small>
-        </div>
-        <div className="system-status-container">
-          <button
-            className="system-status-btn"
-            type="button"
-            onClick={() => {
-              setIsSystemStatusOpen((prev) => !prev);
-              setSystemStatusError(null);
-            }}
-            aria-expanded={isSystemStatusOpen}
-          >
-            <span className="status-indicator-dot"></span>
-            系统状态
-          </button>
-          {isSystemStatusOpen && (
-            <div className="system-status-dropdown">
-              {systemStatusError ? <p className="system-status-error">{systemStatusError}</p> : null}
-              {systemStatus ? <>
-                <div className="dropdown-item">
-                  <span className="dropdown-label">知识库</span>
-                  <span className="dropdown-value">{systemStatus.knowledge_base.collection ?? "未配置"} · {systemStatus.knowledge_base.host ?? "未配置"}</span>
-                </div>
-                <div className="dropdown-item">
-                  <span className="dropdown-label">审查模型</span>
-                  <span className="dropdown-value">{systemStatus.review_model.model ?? "未配置"} · {systemStatus.review_model.configured ? "已配置" : "待配置"}</span>
-                </div>
-                <div className="dropdown-item">
-                  <span className="dropdown-label">PDF 解析</span>
-                  <span className="dropdown-value">{systemStatus.pdf_parser.host ?? "未配置"}</span>
-                </div>
-                <div className="dropdown-item">
-                  <span className="dropdown-label">重排序</span>
-                  <span className="dropdown-value">{systemStatus.reranker.enabled ? systemStatus.reranker.host ?? "待配置" : "已关闭"}</span>
-                </div>
-              </> : !systemStatusError ? <p className="system-status-loading">正在读取真实服务配置…</p> : null}
-              <div className="dropdown-item">
-                <span className="dropdown-label">在线编辑</span>
-                <span className="dropdown-value">Tiptap 审阅草稿</span>
+  const renderIntakeWorkspace = () => (
+    <section
+      className="legal-chat-shell legal-chat-shell-openc"
+      aria-busy={isLoading || isIntakeChatLoading}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        if (isLoading || isIntakeChatLoading) return;
+        const droppedFile = event.dataTransfer.files?.[0];
+        if (droppedFile) handleFileSelection(droppedFile);
+      }}
+    >
+      <div className="legal-chat-timeline" aria-live="polite" ref={intakeTimelineRef}>
+        {!contractOverview ? (
+          <section className="legal-chat-welcome" aria-label="开始合同审查">
+            <h1>今天需要审查什么合同？</h1>
+            <p>上传 Word 或 PDF 合同。AI 会先阅读全文，再通过简短对话确认您的身份、目标与底线。</p>
+            <button
+              className="legal-chat-upload-card"
+              type="button"
+              disabled={isLoading || isIntakeChatLoading}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <span className="legal-chat-upload-card-icon" aria-hidden="true">＋</span>
+              <span>
+                <strong>{file ? "更换当前合同" : "上传合同并开始"}</strong>
+                <small>{file ? `${file.name} · ${formatFileSize(file.size)}` : "支持 DOCX / PDF，单个文件最大 10MB"}</small>
+              </span>
+              <b>{file ? "重新选择" : "选择文件"}</b>
+            </button>
+            <small className="legal-chat-privacy-note">合同内容仅用于本次审查会话，不会被当作合同既有事实之外的依据。</small>
+          </section>
+        ) : null}
+
+        {!contractOverview ? (
+          <article className="legal-chat-message legal-chat-message-assistant">
+            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <div className="legal-chat-message-body">
+              <b>AI 法务助手</b>
+              <p>{file ? "合同已加入会话。点击下方“读取合同”，我会先提炼合同内容，再开始确认审查方向。" : "您也可以先了解流程：上传合同 → 确认审查诉求 → 自动审查与修订。"}</p>
+            </div>
+          </article>
+        ) : null}
+
+        {file ? (
+          <article className="legal-chat-message legal-chat-message-user">
+            <div className="legal-chat-message-body legal-chat-file-message">
+              <span className="legal-chat-file-icon" aria-hidden="true">DOC</span>
+              <div>
+                <b>{file.name}</b>
+                <span>{formatFileSize(file.size)} · {contractOverview ? "合同已读取" : "已添加到会话"}</span>
               </div>
+              <button type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()}>更换</button>
             </div>
-          )}
+          </article>
+        ) : null}
+
+        {isLoading && !contractOverview ? (
+          <article className="legal-chat-message legal-chat-message-assistant legal-chat-message-working">
+            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>正在解析合同、识别交易结构并准备第一个问题…</p></div>
+          </article>
+        ) : null}
+
+        {contractOverview ? (
+          <article className="legal-chat-message legal-chat-message-assistant">
+            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <div className="legal-chat-message-body legal-chat-overview-message">
+              <b>合同已读取 · {contractOverview.overview.contract_type || "待确认合同类型"}</b>
+              <p>{contractOverview.overview.summary}</p>
+              {contractOverview.document_quality ? <small>文本质量：{contractOverview.document_quality.note}</small> : null}
+              {contractOverview.overview.warnings.length ? (
+                <div className="legal-chat-warning">{contractOverview.overview.warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>
+              ) : null}
+            </div>
+          </article>
+        ) : null}
+
+        {contractOverview && intakeMessages.map((message, index) => {
+          const isLatestMessage = index === intakeMessages.length - 1;
+          const quickReplies = message.role === "assistant" && isLatestMessage && !isIntakeChatLoading
+            ? message.quick_replies ?? []
+            : [];
+          const suggestedQuestions = message.role === "assistant" && isLatestMessage && !isIntakeChatLoading
+            ? message.suggested_questions ?? []
+            : [];
+          return (
+            <article className={`legal-chat-message legal-chat-message-${message.role}`} key={`${message.role}-${index}-${message.content.slice(0, 20)}`}>
+              {message.role === "assistant" ? <span className="legal-chat-message-avatar" aria-hidden="true">AI</span> : null}
+              <div className="legal-chat-message-body">
+                <b>{message.role === "assistant" ? "AI 法务助手" : "您"}</b>
+                <p>{message.content}</p>
+                {quickReplies.length ? (
+                  <div className="legal-chat-quick-replies" aria-label="快捷回答">
+                    {quickReplies.map((reply) => (
+                      <button
+                        key={reply}
+                        type="button"
+                        disabled={isLoading || isIntakeChatLoading}
+                        onClick={() => void submitIntakeChatAnswer(reply)}
+                      >
+                        {reply}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {suggestedQuestions.length ? (
+                  <div className="legal-chat-suggested-questions" aria-label="您接下来可能想问">
+                    <span>您接下来可能想问</span>
+                    <div>
+                      {suggestedQuestions.map((question) => (
+                        <button
+                          key={question}
+                          type="button"
+                          disabled={isLoading || isIntakeChatLoading}
+                          onClick={() => void submitIntakeChatAnswer(question)}
+                        >
+                          {question}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </article>
+          );
+        })}
+
+        {isIntakeChatLoading ? (
+          <article className="legal-chat-message legal-chat-message-assistant legal-chat-message-working">
+            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>正在理解您的诉求并更新审核方案…</p></div>
+          </article>
+        ) : null}
+
+        {intakeReadyForReview ? (
+          <article className="legal-chat-plan" aria-label="已生成的审核方案">
+            <div className="legal-chat-plan-heading">
+              <div><span>已生成审核方案</span><strong>将按以下标准进行综合审查</strong></div>
+              <b>可继续对话调整</b>
+            </div>
+            <p>{[
+              intakeCriteria.party_role === "party_a" ? "我方为甲方/采购方" : intakeCriteria.party_role === "party_b" ? "我方为乙方/供应方" : intakeCriteria.party_role === "other" ? `我方角色：${intakeCriteria.other_party_role || "待补充"}` : "我方身份待确认",
+              intakeCriteria.business_context && `业务目标：${intakeCriteria.business_context}`,
+              intakeCriteria.focus_areas.length && `重点：${intakeCriteria.focus_areas.join("、")}`,
+              intakeCriteria.non_negotiables && `底线：${intakeCriteria.non_negotiables}`,
+            ].filter(Boolean).join("；")}</p>
+            <small>这些信息只作为审查立场与谈判偏好，不会被视为合同中已经存在的约定。</small>
+            <div className="legal-chat-plan-action">
+              <button className="primary-button legal-chat-review-start" type="button" disabled={isLoading || isIntakeChatLoading || !deepReviewSettings.party_role} onClick={() => void runDeepReview()}>
+                {isLoading ? "正在进行综合审查…" : "按当前方案开始审查"}
+              </button>
+            </div>
+          </article>
+        ) : null}
+      </div>
+
+      <div className="legal-chat-dock">
+        {intakeChatWarning ? <p className="legal-chat-notice" role="status">{intakeChatWarning}</p> : null}
+        {error ? <p className="error-message legal-chat-error">{error}</p> : null}
+        <form
+          className="legal-chat-composer"
+          onSubmit={(event) => {
+            if (contractOverview) {
+              void sendIntakeChatMessage(event);
+              return;
+            }
+            event.preventDefault();
+            if (file) void handleSubmit(event);
+            else fileInputRef.current?.click();
+          }}
+        >
+          <textarea
+            value={intakeChatDraft}
+            maxLength={2000}
+            disabled={!contractOverview || isIntakeChatLoading || isLoading}
+            onChange={(event) => setIntakeChatDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || !contractOverview || !intakeChatDraft.trim()) return;
+              event.preventDefault();
+              void sendIntakeChatMessage();
+            }}
+            placeholder={contractOverview ? "告诉 AI 您的立场、业务目标、顾虑或不可让步条件…" : file ? "合同已添加，点击右侧按钮开始读取" : "请先通过左侧＋按钮上传合同"}
+          />
+          <div className="legal-chat-composer-actions">
+            <button className="legal-chat-attach" type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()} aria-label="上传或更换合同">＋</button>
+            {!isLoading ? (
+              <button
+                className={`legal-chat-send${contractOverview ? " legal-chat-send-icon" : ""}`}
+                type="submit"
+                title={contractOverview ? "发送消息" : file ? "读取合同" : "选择合同"}
+                aria-label={contractOverview ? "发送消息" : file ? "读取合同" : "选择合同"}
+                disabled={isIntakeChatLoading || (Boolean(contractOverview) && !intakeChatDraft.trim())}
+              >
+                {contractOverview ? isIntakeChatLoading ? "…" : "↑" : file ? "读取合同" : "选择合同"}
+              </button>
+            ) : null}
+          </div>
+        </form>
+        <div className="legal-chat-dock-footer">
+          <span>支持 DOCX / PDF，最大 10MB · 合同内容仅用于本次审查</span>
         </div>
-      </header>
+      </div>
+    </section>
+  );
 
-      <div className="workbench-shell">
-        <aside className="workbench-sidebar" aria-label="本次合同审查导航">
-          <div className="workbench-sidebar-heading">
-            <span>本次工作区</span>
-            <strong>合同审查</strong>
-          </div>
-          <nav className="workbench-flow" aria-label="审查流程进度">
-            <div className={`workbench-flow-item ${file ? "workbench-flow-complete" : "workbench-flow-active"}`}>
-              <b>01</b>
-              <span>导入合同<small>{file ? "已读取文件" : "等待上传"}</small></span>
-            </div>
-            <div className={`workbench-flow-item ${contractOverview ? (review ? "workbench-flow-complete" : "workbench-flow-active") : ""}`}>
-              <b>02</b>
-              <span>确认审查方向<small>{contractOverview ? (review ? "标准已确认" : "与 AI 沟通中") : "待开始"}</small></span>
-            </div>
-            <div className={`workbench-flow-item ${review ? "workbench-flow-active" : ""}`}>
-              <b>03</b>
-              <span>审查与修订<small>{review ? "查看风险与修改" : "待执行"}</small></span>
-            </div>
-          </nav>
-          <div className="workbench-file-summary">
-            <span>当前文件</span>
-            <strong title={currentFilename}>{currentFilename}</strong>
-            <small>{currentFileSize ?? "上传后将在此显示文件信息"}</small>
-          </div>
-          <div className="workbench-sidebar-footer">
-            <span className="workbench-sidebar-footer-dot" aria-hidden="true" />
-            本地会话 · 合同内容仅用于本次审查
-          </div>
-        </aside>
-
+  return (
+    <main className={`app-shell ${review ? "app-shell-review" : "app-shell-chat"}`}>
+      <div className={`workbench-shell${!review ? " workbench-shell-chat" : ""}`}>
         <div className="workbench-main">
           <input
             ref={fileInputRef}
@@ -2462,376 +2615,20 @@ export default function App() {
             onChange={handleFileChange}
           />
 
-          {!review ? (
-        contractOverview ? (
-          <section className="intake-container" aria-busy={isLoading}>
-            <div className="upload-header intake-header">
-              <span className="upload-eyebrow">合同审查会话</span>
-              <div className="workflow-steps" aria-label="审查流程">
-                <span className="workflow-step workflow-step-complete"><b>1</b>上传合同</span>
-                <i aria-hidden="true" />
-                <span className="workflow-step workflow-step-active"><b>2</b>确认立场与诉求</span>
-                <i aria-hidden="true" />
-                <span className="workflow-step"><b>3</b>综合审查与修订</span>
-              </div>
-              <h1>先确认业务立场，再开始综合审查</h1>
-              <p>以下概览仅帮助您快速理解合同，不包含风险判断或修改建议。</p>
-            </div>
-
-            <div className="intake-grid">
-              <section className="contract-overview-card" aria-label="合同概览">
-                <div className="contract-overview-heading">
-                  <div>
-                    <span>合同内容概述</span>
-                    <h2>{contractOverview.overview.contract_type || "待确认合同类型"}</h2>
-                  </div>
-                  <button className="secondary-button" type="button" disabled={isLoading} onClick={() => fileInputRef.current?.click()}>重新选择</button>
-                </div>
-                <p className="contract-overview-summary">{contractOverview.overview.summary}</p>
-                {contractOverview.overview.warnings.length ? <div className="overview-warnings" role="status">{contractOverview.overview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div> : null}
-                {contractOverview.document_quality ? <p className="overview-quality-note">文本质量：{contractOverview.document_quality.note}</p> : null}
-              </section>
-
-              <section className="deep-review-settings intake-review-settings" aria-label="审查立场与诉求">
-                <div className="intake-chat-native">
-                  <div className="intake-chat-session" aria-label="会话状态">
-                    <span className="intake-chat-avatar" aria-hidden="true">AI</span>
-                    <div>
-                      <strong>AI 法务助手</strong>
-                      <span>已读取：{contractOverview.overview.contract_type || "当前合同"} · 正在确定审查标准</span>
-                    </div>
-                    <b>{intakeReadyForReview ? "可开始审查" : "引导中"}</b>
-                  </div>
-                  <div className="deep-review-heading">
-                    <div>
-                      <strong>和 AI 法务助手聊聊这份合同</strong>
-                      <span>请用日常语言回答。助手会根据合同内容逐步厘清我方立场、目标、顾虑与底线。</span>
-                    </div>
-                    <b>{intakeReadyForReview ? "标准已就绪" : "对话中"}</b>
-                  </div>
-                  <section className="intake-model-chat" aria-label="AI 法务助手对话" aria-live="polite">
-                    {intakeMessages.length ? intakeMessages.map((message, index) => (
-                      <article className={`intake-message intake-message-${message.role}`} key={`${message.role}-${index}-${message.content.slice(0, 20)}`}>
-                        <div className="intake-message-meta">
-                          <span className="intake-message-avatar" aria-hidden="true">{message.role === "assistant" ? "AI" : "您"}</span>
-                          <b>{message.role === "assistant" ? "AI 法务助手" : "您"}</b>
-                        </div>
-                        <p>{message.content}</p>
-                      </article>
-                    )) : <article className="intake-message intake-message-assistant"><div className="intake-message-meta"><span className="intake-message-avatar" aria-hidden="true">AI</span><b>AI 法务助手</b></div><p>正在阅读合同并准备第一个问题…</p></article>}
-                    {isIntakeChatLoading ? <article className="intake-message intake-message-assistant intake-message-typing"><div className="intake-message-meta"><span className="intake-message-avatar" aria-hidden="true">AI</span><b>AI 法务助手</b></div><p>正在整理合同信息…</p></article> : null}
-                  </section>
-                  <form className="intake-model-compose" onSubmit={(event) => void sendIntakeChatMessage(event)}>
-                    <div className="intake-compose-field">
-                      <label htmlFor="intake-chat-input">回复 AI 法务助手</label>
-                      <textarea id="intake-chat-input" value={intakeChatDraft} maxLength={2000} disabled={isIntakeChatLoading} onChange={(event) => setIntakeChatDraft(event.target.value)} placeholder="例如：我是采购方，项目必须按期上线；不能接受默认验收，也不能让对方使用我们的数据训练模型。" />
-                      <small>用日常语言描述目标、顾虑或底线即可；这些信息不会自动写入合同。</small>
-                    </div>
-                    <button type="submit" disabled={isIntakeChatLoading || !intakeChatDraft.trim()}>{isIntakeChatLoading ? "思考中" : "发送"}</button>
-                  </form>
-                  {intakeChatWarning ? <p className="intake-chat-warning" role="status">{intakeChatWarning}</p> : null}
-                  <aside className="intake-review-summary" aria-live="polite">
-                    <strong>当前已确认的审核标准</strong>
-                    <p>{[
-                      intakeCriteria.party_role === "party_a" ? "我方为甲方/采购方" : intakeCriteria.party_role === "party_b" ? "我方为乙方/供应方" : intakeCriteria.party_role === "other" ? `我方角色：${intakeCriteria.other_party_role || "待补充"}` : "我方身份待确认",
-                      intakeCriteria.business_context && `业务目标：${intakeCriteria.business_context}`,
-                      intakeCriteria.focus_areas.length && `重点：${intakeCriteria.focus_areas.join("、")}`,
-                      intakeCriteria.non_negotiables && `底线：${intakeCriteria.non_negotiables}`
-                    ].filter(Boolean).join("；")}</p>
-                    <small>这些内容只会作为后续审查的立场与谈判偏好，不会被视为合同中已经约定的事实。</small>
-                  </aside>
-                  {error ? <p className="error-message intake-error">{error}</p> : null}
-                  <button className="primary-button deep-review-start" type="button" disabled={isLoading || isIntakeChatLoading || !intakeReadyForReview || !deepReviewSettings.party_role} onClick={() => void runDeepReview()}>{isLoading ? "正在进行综合审查…" : intakeReadyForReview ? "按当前标准开始综合审查" : "请先完成 AI 问答"}</button>
-                </div>
-                <div hidden aria-hidden="true">
-                <div className="deep-review-heading">
-                  <div><strong>和法务助手确认审阅方向</strong><span>不用填写复杂表单；系统会根据合同内容和您的回答生成审阅重点。</span></div>
-                  <b>对话确认</b>
-                </div>
-                <section className="intake-conversation" aria-label="法务助手问答">
-                  <div className="intake-chat-progress" aria-label="问答进度">
-                    {(["role", "objective", "focus", "redlines"] as const).map((step, index) => (
-                      <span className={intakeConversationStep === step || (index === 0 && Boolean(deepReviewSettings.party_role)) || (index === 1 && ["focus", "redlines", "ready"].includes(intakeConversationStep)) || (index === 2 && ["redlines", "ready"].includes(intakeConversationStep)) || intakeConversationStep === "ready" ? "intake-chat-progress-active" : ""} key={step}>{index + 1}</span>
-                    ))}
-                  </div>
-
-                  <article className="intake-message intake-message-assistant">
-                    <b>AI 法务助手</b>
-                    <p>我已阅读合同概览。先确认：您代表哪一方？这只用于确定审查立场，不会替您假设商业目标或红线。</p>
-                  </article>
-                  {!deepReviewSettings.party_role || intakeConversationStep === "role" ? (
-                    <>
-                      <div className="intake-answer-options">
-                        <button className={deepReviewSettings.party_role === "party_a" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeRole("party_a")}>我是甲方 / 采购方</button>
-                        <button className={deepReviewSettings.party_role === "party_b" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeRole("party_b")}>我是乙方 / 供应商</button>
-                        <button className={deepReviewSettings.party_role === "other" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeRole("other")}>其他角色</button>
-                      </div>
-                      {deepReviewSettings.party_role === "other" ? <input className="deep-text-input intake-other-role" value={deepReviewSettings.other_party_role} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, other_party_role: event.target.value }))} placeholder="例如：合作开发方、受托处理方" /> : null}
-                      {deepReviewSettings.party_role === "other" ? <div className="intake-step-actions"><button className="primary-button" type="button" disabled={!deepReviewSettings.other_party_role.trim()} onClick={() => setIntakeConversationStep("objective")}>继续</button></div> : null}
-                    </>
-                  ) : null}
-
-                  {deepReviewSettings.party_role ? (
-                    <>
-                      <article className="intake-message intake-message-user intake-message-editable">
-                        <p>{deepReviewSettings.party_role === "party_a" ? "我是甲方/采购方，希望优先保护采购与验收权益。" : deepReviewSettings.party_role === "party_b" ? "我是乙方/供应商，希望控制履约和责任风险。" : deepReviewSettings.other_party_role ? `我的角色是：${deepReviewSettings.other_party_role}` : "我是其他合同角色。"}</p>
-                        <button type="button" onClick={() => setIntakeConversationStep("role")}>修改</button>
-                      </article>
-                      <article className="intake-message intake-message-assistant">
-                        <b>AI 法务助手</b>
-                        <p>从法务角度，先不谈条款名称：这次交易成功的标准是什么？您最希望拿到什么结果，或最怕发生什么事？</p>
-                      </article>
-                    </>
-                  ) : null}
-
-                  {deepReviewSettings.party_role && intakeConversationStep === "objective" ? (
-                    <>
-                      <label className="intake-free-answer">
-                        <span>用日常语言回答即可</span>
-                        <textarea value={deepReviewSettings.business_context} maxLength={2000} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, business_context: event.target.value }))} placeholder="例如：项目必须在 10 月上线，预算不超 50 万；我担心交付延期、验收被架空，以及上线后对方推卸责任。" />
-                      </label>
-                      <div className="intake-step-actions"><button className="secondary-button" type="button" onClick={continueIntakeObjective}>暂不补充</button><button className="primary-button" type="button" onClick={continueIntakeObjective}>继续</button></div>
-                    </>
-                  ) : null}
-
-                  {["focus", "redlines", "ready"].includes(intakeConversationStep) ? (
-                    <>
-                      <article className="intake-message intake-message-user intake-message-editable">
-                        <p>{deepReviewSettings.business_context.trim() || "暂未补充具体业务目标，请按通用商业标准审查。"}</p>
-                        <button type="button" onClick={() => setIntakeConversationStep("objective")}>修改</button>
-                      </article>
-                      <article className="intake-message intake-message-assistant">
-                        <b>AI 法务助手</b>
-                        <p>{intakeRecommendations?.rationale ?? "结合您的目标，以下是值得优先核对的方向。可多选、取消或跳过；它们只是建议，不会限制审查范围。"}</p>
-                        {intakeRecommendations ? <button className="intake-inline-action" type="button" onClick={applyRecommendedFocus}>采用合同推荐重点</button> : null}
-                      </article>
-                    </>
-                  ) : null}
-
-                  {intakeConversationStep === "focus" ? (
-                    <>
-                      <div className="intake-answer-options intake-answer-options-chips">
-                        {quickFocusOptions.map((option) => <button className={deepReviewSettings.focus_areas.includes(option) ? "intake-answer-selected" : ""} type="button" key={option} onClick={() => toggleDeepSettingOption("focus_areas", option)}>{option}</button>)}
-                        <button className={deepReviewSettings.focus_areas.includes("全部") ? "intake-answer-selected" : ""} type="button" onClick={() => setDeepReviewSettings((current) => ({ ...current, focus_areas: current.focus_areas.includes("全部") ? [] : ["全部"] }))}>全面审查</button>
-                      </div>
-                      <div className="intake-step-actions"><button className="primary-button" type="button" onClick={continueIntakeFocus}>继续</button></div>
-                    </>
-                  ) : null}
-
-                  {["redlines", "ready"].includes(intakeConversationStep) ? (
-                    <>
-                      <article className="intake-message intake-message-user intake-message-editable">
-                        <p>{deepReviewSettings.focus_areas.length && !deepReviewSettings.focus_areas.includes("全部") ? `优先关注：${deepReviewSettings.focus_areas.join("、")}。` : "请全面审查，不限定优先条款。"}</p>
-                        <button type="button" onClick={() => setIntakeConversationStep("focus")}>修改</button>
-                      </article>
-                      <article className="intake-message intake-message-assistant">
-                        <b>AI 法务助手</b>
-                        <p>哪些条件您绝不能接受？例如预付款比例、验收权、数据使用、责任上限或退出成本。最后再选择谈判取向。</p>
-                      </article>
-                    </>
-                  ) : null}
-
-                  {intakeConversationStep === "redlines" ? (
-                    <>
-                      <label className="intake-free-answer"><span>不可让步条件（可选；没有可不填）</span><textarea value={deepReviewSettings.non_negotiables} maxLength={2000} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, non_negotiables: event.target.value }))} placeholder="例如：不得默认验收；不得将客户数据用于 AI 训练；付款必须与验收和发票挂钩。" /></label>
-                      <div className="intake-answer-options intake-answer-options-chips">{deepRequirementOptions.slice(0, 6).map((option) => <button className={deepReviewSettings.special_requirements.includes(option) ? "intake-answer-selected" : ""} type="button" key={option} onClick={() => toggleDeepSettingOption("special_requirements", option)}>{option}</button>)}</div>
-                      <div className="intake-review-style"><span>谈判取向</span><div className="intake-answer-options"><button className={deepReviewSettings.review_style === "protective" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeStyle("protective")}>尽量争取我方利益</button><button className={deepReviewSettings.review_style === "balanced" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeStyle("balanced")}>平衡合作与风险</button><button className={deepReviewSettings.review_style === "material_only" ? "intake-answer-selected" : ""} type="button" onClick={() => answerIntakeStyle("material_only")}>只提示重大问题</button></div></div>
-                    </>
-                  ) : null}
-
-                  {intakeConversationStep === "ready" ? <><article className="intake-message intake-message-user intake-message-editable"><p>{deepReviewSettings.non_negotiables.trim() ? `不可让步：${deepReviewSettings.non_negotiables}` : "暂无额外不可让步条件。"}</p><button type="button" onClick={() => setIntakeConversationStep("redlines")}>修改</button></article><article className="intake-message intake-message-assistant intake-message-ready"><b>AI 法务助手</b><p>我会将您的目标、优先事项和红线视为审查偏好，而不当作合同事实。现在可以开始综合审查。</p></article></> : null}
-                </section>
-                <details className="intake-more-options">
-                  <summary>补充更多交易背景与审阅偏好（可选）</summary>
-                  <div className="intake-more-options-content">
-                <fieldset className="deep-fieldset intake-scenario-fieldset">
-                  <legend>这份合同属于哪类业务场景 <small>可选；一键带入常见关注点，之后仍可调整</small></legend>
-                  <div className="scenario-preset-grid">
-                    {scenarioPresets.map((preset) => (
-                      <button type="button" key={preset.name} onClick={() => applyScenarioPreset(preset)}>
-                        <strong>{preset.name}</strong>
-                        <span>{preset.description}</span>
-                      </button>
-                    ))}
-                  </div>
-                </fieldset>
-                <fieldset className="deep-fieldset">
-                  <legend>交易目前处于什么阶段 <small>可选；帮助判断谈判力度和升级事项</small></legend>
-                  <div className="deep-option-grid context-options">
-                    {transactionStageOptions.map((option) => <label className={deepReviewSettings.transaction_stage === option ? "deep-option-selected" : ""} key={option}><input type="radio" name="transaction-stage" checked={deepReviewSettings.transaction_stage === option} onChange={() => setDeepReviewSettings((current) => ({ ...current, transaction_stage: option }))} />{option}</label>)}
-                  </div>
-                </fieldset>
-                <div className="deep-select-row intake-context-row">
-                  <label>合同文本由谁提供（可选）<select value={deepReviewSettings.counterparty_context} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, counterparty_context: event.target.value }))}><option value="">暂不确定</option>{counterpartyContextOptions.map((option) => <option value={option} key={option}>{option}</option>)}</select></label>
-                  <label>时间与推进约束（可选）<select value={deepReviewSettings.timeline_urgency} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, timeline_urgency: event.target.value }))}><option value="">暂不确定</option>{timelineUrgencyOptions.map((option) => <option value={option} key={option}>{option}</option>)}</select></label>
-                </div>
-                <fieldset className="deep-fieldset">
-                  <legend>这次交易最看重什么 <small>可多选；用来决定谈判排序</small></legend>
-                  <div className="deep-chip-list">{dealPriorityOptions.map((option) => <label className={deepReviewSettings.deal_priorities.includes(option) ? "deep-chip-selected" : ""} key={option}><input type="checkbox" checked={deepReviewSettings.deal_priorities.includes(option)} onChange={() => toggleDeepSettingOption("deal_priorities", option)} />{option}</label>)}</div>
-                </fieldset>
-                <fieldset className="deep-fieldset">
-                  <legend>希望重点帮您把关什么 <small>可选；不选仍会全面审查</small></legend>
-                  <div className="deep-chip-list">{deepFocusOptions.map((option) => <label className={deepReviewSettings.focus_areas.includes(option) ? "deep-chip-selected" : ""} key={option}><input type="checkbox" checked={deepReviewSettings.focus_areas.includes(option)} onChange={() => toggleDeepSettingOption("focus_areas", option)} />{option}</label>)}</div>
-                </fieldset>
-                <div className="deep-select-row">
-                  <label>审查强度<select value={deepReviewSettings.review_style} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, review_style: event.target.value as ReviewStyle }))}><option value="protective">严格保护我方利益</option><option value="balanced">平衡商业合作</option><option value="material_only">仅提示重大问题</option></select></label>
-                  <label>合同类型（可选）<input list="contract-type-suggestions" value={deepReviewSettings.contract_type} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, contract_type: event.target.value }))} placeholder="例如：SaaS 服务合同" /><datalist id="contract-type-suggestions">{contractTypeSuggestions.map((option) => <option value={option} key={option} />)}</datalist></label>
-                </div>
-                <fieldset className="deep-fieldset">
-                  <legend>我方不可让步事项 <small>可选；只选真正不能接受的条件</small></legend>
-                  <div className="deep-chip-list">{deepRequirementOptions.map((option) => <label className={deepReviewSettings.special_requirements.includes(option) ? "deep-chip-selected" : ""} key={option}><input type="checkbox" checked={deepReviewSettings.special_requirements.includes(option)} onChange={() => toggleDeepSettingOption("special_requirements", option)} />{option}</label>)}</div>
-                </fieldset>
-                <label className="deep-textarea-label">用一句话补充业务背景（可选）<textarea value={deepReviewSettings.business_context} maxLength={2000} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, business_context: event.target.value }))} placeholder="例如：计划在 10 月上线；系统会处理客户订单信息；预算不超过 50 万；合作期希望为 1 年。" /><small>可写上线节点、金额边界、服务对象、数据类型、合作期限或对方已承诺的关键事项。</small></label>
-                <label className="deep-textarea-label">还有哪些情况绝对不能接受（可选）<textarea value={deepReviewSettings.non_negotiables} maxLength={2000} onChange={(event) => setDeepReviewSettings((current) => ({ ...current, non_negotiables: event.target.value }))} placeholder="例如：不能接受验收默认通过；对方不得用我们的数据训练模型；不能接受自动续约或高额违约金。" /><small>这里写的是谈判红线，不是合同中已经存在的约定。</small></label>
-                  </div>
-                </details>
-                <section className="intake-chat-box" aria-label="补充给法务助手">
-                  <div className="intake-chat-heading">
-                    <div><strong>补充给法务助手</strong><span>用日常语言告诉我任何顾虑、背景或希望争取的条件。</span></div>
-                    <b>{deepReviewSettings.additional_notes.length}/5</b>
-                  </div>
-                  {deepReviewSettings.additional_notes.length ? (
-                    <div className="intake-chat-history">
-                      {deepReviewSettings.additional_notes.map((note) => <article key={note}><p>{note}</p><button type="button" onClick={() => removeAdditionalNote(note)} aria-label="删除这条补充">删除</button></article>)}
-                    </div>
-                  ) : <p className="intake-chat-empty">例如：“这次合作很急，但不能牺牲验收标准”“对方可能要求使用客户数据”“管理层最在意总价和退出成本”。</p>}
-                  <div className="intake-chat-compose">
-                    <textarea value={additionalNoteDraft} maxLength={500} onChange={(event) => setAdditionalNoteDraft(event.target.value)} placeholder="输入一条补充想法…" />
-                    <button type="button" disabled={!additionalNoteDraft.trim()} onClick={addAdditionalNote}>发送</button>
-                  </div>
-                  <small>已发送的内容会作为审查偏好与业务背景传给模型；不会自动写入合同，也不会被当作合同已约定事实。</small>
-                </section>
-                <aside className="intake-review-summary" aria-live="polite">
-                  <strong>本次审查将按以下立场执行</strong>
-                  <p>{intakeInstructionSummary || "请先选择我方身份；其他选项均可按实际情况补充。"}</p>
-                  <small>未选择的项目仍会进行基础审查；系统只会把您明确选择的内容视为谈判偏好或红线。</small>
-                </aside>
-                {error ? <p className="error-message intake-error">{error}</p> : null}
-                <button className="primary-button deep-review-start" type="button" disabled={isLoading || !deepReviewSettings.party_role} onClick={() => void runDeepReview()}>{isLoading ? "正在进行综合审查…" : "开始综合审查"}</button>
-                </div>
-              </section>
-            </div>
-          </section>
-        ) : (
-        <div className="upload-container">
-          <div className="upload-header">
-            <span className="upload-eyebrow">AI 合同审查工作台</span>
-            <div className="workflow-steps" aria-label="审核流程">
-              <span className="workflow-step workflow-step-active"><b>1</b>上传合同</span>
-              <i aria-hidden="true" />
-              <span className="workflow-step"><b>2</b>确认立场与诉求</span>
-              <i aria-hidden="true" />
-              <span className="workflow-step"><b>3</b>查看建议</span>
-            </div>
-            <h1>上传合同，生成可追溯法规依据的审查建议。</h1>
-            <p>审查完成后，可在原文中定位风险条款并查看修改建议。</p>
-          </div>
-
-          <div className="upload-card">
-            <div
-              className={`upload-dropzone ${file ? "upload-dropzone-active" : ""}`}
-              onClick={() => !isLoading && fileInputRef.current?.click()}
-              onDragOver={(e) => {
-                e.preventDefault();
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                if (isLoading) return;
-                const droppedFile = e.dataTransfer.files?.[0];
-                if (droppedFile) {
-                  handleFileSelection(droppedFile);
-                }
-              }}
-            >
-              <div className="upload-dropzone-inner">
-                {file ? (
-                  <>
-                    <span className="upload-file-icon">📄</span>
-                    <strong className="upload-file-name">{file.name}</strong>
-                    <span className="upload-file-size">{formatFileSize(file.size)}</span>
-                  </>
-                ) : (
-                  <>
-                    <span className="upload-icon">📥</span>
-                    <strong>拖入或选择合同文件</strong>
-                    <span className="upload-hint">支持 .docx / .pdf 格式，最大 10MB；DOCX 审查后可在线引用修改</span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            <section className="fixed-review-flow" aria-label="审查流程">
-              <strong>先快速了解合同，再一次完成综合审查</strong>
-              <span>上传后，系统先概览合同内容并请您确认我方身份、业务目标与底线；确认后一次完成基础质量、合同框架和商业利益导向审查，随后直接进入现有编辑与导出页面。</span>
-            </section>
-
-            <div className="upload-action-row">
-              {!file ? (
-                <button
-                  className="primary-button upload-submit-btn"
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  选择合同并开始审查
-                </button>
-              ) : (
-                <div className="upload-btn-group">
-                  <button
-                    className="primary-button upload-submit-btn"
-                    type="button"
-                    disabled={isLoading}
-                    onClick={() => void handleSubmit()}
-                  >
-                  {isLoading ? "正在读取合同概览…" : "上传并了解合同"}
-                  </button>
-                  {!isLoading && (
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => {
-                        setFile(null);
-                        setError(null);
-                        if (fileInputRef.current) {
-                          fileInputRef.current.value = "";
-                        }
-                      }}
-                    >
-                      重新选择
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {isLoading && (
-              <div className="upload-progress-panel">
-                <div className="progress-bar" />
-                <p>正在读取合同并生成快速概览…</p>
-              </div>
-            )}
-
-            {error && <p className="error-message upload-error">{error}</p>}
-
-            <div className="upload-status-footer">
-              <span className="status-dot"></span>
-              法规知识库已连接 · 审查模型 Qwen-Max
-            </div>
-          </div>
-        </div>
-        )
-      ) : (
+          {!review ? renderIntakeWorkspace() : (
         <section
-          className={`workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`}
+          className={`workspace robin-review-workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`}
           aria-busy={isLoading}
           style={readerPanelHeight && !isSidebarCollapsed ? { "--review-panel-height": `${readerPanelHeight}px` } as CSSProperties : undefined}
         >
-          <section className="reader-panel" ref={readerPanelRef}>
+          <section className="reader-panel robin-document-panel" ref={readerPanelRef}>
             <div className="compact-document-bar">
               <div className="document-info">
                 <span className="document-icon" aria-hidden="true">
                   📄
                 </span>
                 <div>
+                  <span className="document-context-label">当前修订文档</span>
                   <strong>{currentFilename}</strong>
                   <span className="document-size">
                     {currentFileSize ?? "文件已载入"} · {review.contract_type ?? "通用商务合同"}
@@ -2868,12 +2665,9 @@ export default function App() {
             ) : null}
 
             {error ? <p className="error-message">{error}</p> : null}
-            {editorNotice ? <p className="success-message">{editorNotice}</p> : null}
-
             <section className="editor-panel editor-panel-promoted" aria-label="合同正文编辑">
               <div className="editor-heading">
                 <div>
-                  <p className="editor-edit-hint">可直接点击正文进行编辑；右侧“定位”按钮会跳转到对应条款。</p>
                   <h2>合同正文</h2>
                 </div>
                 <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
@@ -2897,7 +2691,7 @@ export default function App() {
                 <button type="button" title="下划线" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleUnderline().run()}><u>U</u></button>
                 <button type="button" className="highlight-tool" title="黄色高亮" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleHighlight({ color: "#fff19a" }).run()}>A</button>
                 <button type="button" className="text-color-tool" title="绿色文字" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().setColor("#146b49").run()}>A</button>
-                <button type="button" title="清除文字格式" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().unsetAllMarks().run()}>清除格式</button>
+                <button type="button" className="clear-format-tool" title="清除文字格式" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().unsetAllMarks().run()}>清除格式</button>
                 <span className="toolbar-divider" aria-hidden="true" />
                 <button type="button" title="撤销" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().undo().run()}>↶</button>
                 <button type="button" title="重做" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().redo().run()}>↷</button>
@@ -2919,12 +2713,16 @@ export default function App() {
             </section>
           </section>
 
-          <aside className={`review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
-            <section className="result-panel">
+          <aside className={`review-sidebar robin-review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
+            <section className="result-panel robin-result-panel">
               <div className="result-header">
                 <div className="result-header-title-row">
                   <div>
-                    <h2>审查结果</h2>
+                    <span className="result-context-label">智能修订</span>
+                    <div className="result-title-line">
+                      <h2>审查结果</h2>
+                      <span className="result-total-count">{totalRisks} 项</span>
+                    </div>
                     {review.contract_type ? <p className="result-subtitle">合同类型：{review.contract_type}</p> : null}
                   </div>
                   <button
@@ -2952,185 +2750,6 @@ export default function App() {
               ) : null}
 
               <div className="result-stack" aria-live="polite">
-                <div className="summary-band">
-                  <div>
-                    <span>总风险</span>
-                    <strong>{totalRisks}</strong>
-                  </div>
-                  <div>
-                    <span>法规依据</span>
-                    <strong>{sortedRisks.reduce((count, risk) => count + (risk.laws?.length ?? 0), 0)}</strong>
-                  </div>
-                  <div>
-                    <span>已接受</span>
-                    <strong>{modifications.length}</strong>
-                  </div>
-                </div>
-
-                <div className="review-progress-panel">
-                  <div className="review-progress-heading">
-                    <div>
-                      <strong>审核进度</strong>
-                      <span>{reviewProgress.checked}/{reviewProgress.total} 个范围已完成规则检查</span>
-                    </div>
-                    <b>{reviewProgress.percentage}%</b>
-                  </div>
-                  <div className="review-progress-track"><span style={{ width: `${Math.min(reviewProgress.percentage, 100)}%` }} /></div>
-                  <div className="review-progress-meta">
-                    <span>法规依据已核验 {reviewProgress.verified} 项</span>
-                    <span>风险已处理 {processedRiskCount}/{totalRisks} 项</span>
-                  </div>
-                </div>
-
-                {reviewStage === "modification" && preflightChecks.length ? (
-                  <details className="preflight-panel" aria-label="基础质量与合同框架检查">
-                    <summary className="preflight-heading">
-                      <div>
-                        <strong>基础质量与合同框架</strong>
-                        <span>文字、标点和框架检查；点击展开查看明细。</span>
-                      </div>
-                      <b className={preflightWarnings.length ? "preflight-count-warning" : "preflight-count-passed"}>
-                        {preflightWarnings.length ? `需核对 ${preflightWarnings.length} 项` : "检查通过"}
-                      </b>
-                    </summary>
-                    <div className="preflight-list">
-                      {preflightChecks.map((check, index) => {
-                        const checkKey = `${check.category}-${check.title}-${index}`;
-                        const decision = preflightDecisions[checkKey];
-                        const needsDecision = check.status === "warning" && !check.auto_fixable;
-                        return (
-                          <article className={`preflight-row preflight-row-${check.status}`} key={checkKey}>
-                            <div className="preflight-row-heading">
-                              <span className={`preflight-category preflight-category-${check.category}`}>
-                                {check.category === "structure" ? "框架" : check.category === "scope" ? "范围" : check.category === "punctuation" ? "标点" : "文字"}
-                              </span>
-                              <strong>{check.title}</strong>
-                              <b>
-                                {check.status === "passed"
-                                  ? "已检查"
-                                  : check.auto_fixable
-                                    ? "已自动修正"
-                                    : decision === "confirmed"
-                                      ? "已确认"
-                                      : decision === "deferred"
-                                        ? "暂不处理"
-                                        : "待人工确认"}
-                              </b>
-                            </div>
-                            {check.evidence ? <p>{check.evidence}</p> : null}
-                            {check.suggestion ? <small>建议：{check.suggestion}</small> : null}
-                            {needsDecision ? (
-                              <div className="preflight-quality-actions">
-                                <small>此项不会自动改写合同，请核对原件后选择处理方式。</small>
-                                <div>
-                                  <button
-                                    className={decision === "confirmed" ? "preflight-quality-active" : ""}
-                                    type="button"
-                                    onClick={() => setPreflightDecision(checkKey, "confirmed", check.title)}
-                                  >
-                                    确认已核对
-                                  </button>
-                                  <button
-                                    className={decision === "deferred" ? "preflight-quality-active" : ""}
-                                    type="button"
-                                    onClick={() => setPreflightDecision(checkKey, "deferred", check.title)}
-                                  >
-                                    暂不处理
-                                  </button>
-                                </div>
-                              </div>
-                            ) : null}
-                          </article>
-                        );
-                      })}
-                    </div>
-                  </details>
-                ) : null}
-
-                {reviewStage === "modification" && review.deep_review ? (
-                  <section className="deep-review-result" aria-label="深度审查结论">
-                    <div className="deep-review-heading"><div><strong>深度审查结论：{review.deep_review.overall_conclusion}</strong><span>{review.deep_review.settings_note}</span></div><b>已完成</b></div>
-                    <p>{review.deep_review.executive_summary}</p>
-                    {review.deep_review.key_facts.length ? <details open><summary>关键条款与结论</summary><div className="deep-result-list">{review.deep_review.key_facts.map((fact, index) => <article key={`${fact.item}-${index}`}><b>{fact.item}</b><span>{fact.contract_term}</span><small>{fact.conclusion}</small></article>)}</div></details> : null}
-                    {review.deep_review.missing_clauses.length ? <details><summary>需补充的条款</summary><ul>{review.deep_review.missing_clauses.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
-                    {review.deep_review.negotiation_items.length ? <details><summary>谈判清单</summary><div className="deep-result-list">{review.deep_review.negotiation_items.map((item, index) => <article key={`${item.topic}-${index}`}><b>{item.topic} · {item.owner}</b><span>目标：{item.target}</span><small>底线：{item.minimum_acceptable}</small></article>)}</div></details> : null}
-                    {review.deep_review.clarification_questions.length ? <details><summary>待业务确认</summary><ul>{review.deep_review.clarification_questions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
-                  </section>
-                ) : null}
-
-                <div className={`review-integrity-panel review-integrity-${review.review_status}`}>
-                  <div className="review-integrity-heading">
-                    <strong>
-                      {review.review_status === "complete"
-                        ? "审查已完成"
-                        : review.review_status === "partial"
-                          ? "审查部分完成"
-                          : "需要人工复核"}
-                    </strong>
-                    {review.review_duration_ms ? <span>{review.review_duration_ms} ms</span> : null}
-                  </div>
-                  <p>{review.review_summary || "系统未返回可验证的审查说明。"}</p>
-                  {review.warnings.length ? (
-                    <ul>
-                      {review.warnings.map((warning) => <li key={warning}>{warning}</li>)}
-                    </ul>
-                  ) : null}
-                </div>
-
-                {review.document_quality ? (
-                  <div className={`document-quality-panel document-quality-${review.document_quality.status}`}>
-                    <div>
-                      <strong>文档文本质量</strong>
-                      <span>
-                        {review.document_quality.status === "searchable"
-                          ? "可搜索文本"
-                          : review.document_quality.status === "partial"
-                            ? "部分识别"
-                            : review.document_quality.status === "scanned"
-                              ? "疑似扫描件"
-                              : "DOCX 原生文本"}
-                      </span>
-                    </div>
-                    <p>{review.document_quality.note}</p>
-                    {review.document_quality.kind === "pdf" ? (
-                      <small>
-                        {review.document_quality.pages ?? 0} 页 · 已提取 {review.document_quality.extracted_chars} 个字符
-                        {review.document_quality.ocr_detected ? " · 检测到 OCR" : ""}
-                      </small>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {(review.consistency_checks?.length || review.policy_version) ? (
-                  <div className="consistency-panel" aria-label="合同一致性检查">
-                    <div className="consistency-panel-heading">
-                      <strong>规范化检查</strong>
-                      <span>政策版本 {review.policy_version || "2026.08"}</span>
-                    </div>
-                    <p className="consistency-method">
-                      审核方式：{review.review_method === "model" ? "模型" : review.review_method === "rule" ? "规则" : "模型 + 规则"}
-                      {review.manual_review_required !== false ? "；结果需人工复核" : ""}
-                    </p>
-                    {review.consistency_checks?.length ? (
-                      <div className="consistency-list">
-                        {review.consistency_checks.map((check) => (
-                          <div className={`consistency-row consistency-row-${check.status}`} key={check.check}>
-                            <span>{check.check}</span>
-                            <strong>{check.status === "warning" ? "需确认" : "已检查"}</strong>
-                            <small>{check.note}</small>
-                            {check.evidence ? (
-                              <details className="consistency-evidence">
-                                <summary>查看依据</summary>
-                                <p>{check.evidence}</p>
-                              </details>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    ) : <small>本次范围内未触发内部一致性检查。</small>}
-                  </div>
-                ) : null}
-
                 {unlocatableRisks.length ? (
                   <section className="unlocatable-risk-panel" aria-label="未定位到原文的风险项">
                     <div>
@@ -3140,6 +2759,14 @@ export default function App() {
                     <p>请打开对应风险卡，核对原合同后手动编辑；可复制建议文本，但“已接受修改”只统计实际写入正文的内容。</p>
                   </section>
                 ) : null}
+
+                <div className="risk-list-heading">
+                  <div>
+                    <strong>智能修订建议</strong>
+                    <span>保留全部风险原文、分析依据与修改建议</span>
+                  </div>
+                  <b>{filteredRisks.length}</b>
+                </div>
 
                 <div className="risk-filter-bar" role="tablist" aria-label="风险筛选">
                   <button
@@ -3402,6 +3029,82 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {reviewStage === "modification" && preflightChecks.length ? (
+                  <details className="preflight-panel" aria-label="基础质量与合同框架检查">
+                    <summary className="preflight-heading">
+                      <div>
+                        <strong>基础质量与合同框架</strong>
+                        <span>文字、标点和框架检查；点击展开查看明细。</span>
+                      </div>
+                      <b className={preflightWarnings.length ? "preflight-count-warning" : "preflight-count-passed"}>
+                        {preflightWarnings.length ? `需核对 ${preflightWarnings.length} 项` : "检查通过"}
+                      </b>
+                    </summary>
+                    <div className="preflight-list">
+                      {preflightChecks.map((check, index) => {
+                        const checkKey = `${check.category}-${check.title}-${index}`;
+                        const decision = preflightDecisions[checkKey];
+                        const needsDecision = check.status === "warning" && !check.auto_fixable;
+                        return (
+                          <article className={`preflight-row preflight-row-${check.status}`} key={checkKey}>
+                            <div className="preflight-row-heading">
+                              <span className={`preflight-category preflight-category-${check.category}`}>
+                                {check.category === "structure" ? "框架" : check.category === "scope" ? "范围" : check.category === "punctuation" ? "标点" : "文字"}
+                              </span>
+                              <strong>{check.title}</strong>
+                              <b>
+                                {check.status === "passed"
+                                  ? "已检查"
+                                  : check.auto_fixable
+                                    ? "已自动修正"
+                                    : decision === "confirmed"
+                                      ? "已确认"
+                                      : decision === "deferred"
+                                        ? "暂不处理"
+                                        : "待人工确认"}
+                              </b>
+                            </div>
+                            {check.evidence ? <p>{check.evidence}</p> : null}
+                            {check.suggestion ? <small>建议：{check.suggestion}</small> : null}
+                            {needsDecision ? (
+                              <div className="preflight-quality-actions">
+                                <small>此项不会自动改写合同，请核对原件后选择处理方式。</small>
+                                <div>
+                                  <button
+                                    className={decision === "confirmed" ? "preflight-quality-active" : ""}
+                                    type="button"
+                                    onClick={() => setPreflightDecision(checkKey, "confirmed", check.title)}
+                                  >
+                                    确认已核对
+                                  </button>
+                                  <button
+                                    className={decision === "deferred" ? "preflight-quality-active" : ""}
+                                    type="button"
+                                    onClick={() => setPreflightDecision(checkKey, "deferred", check.title)}
+                                  >
+                                    暂不处理
+                                  </button>
+                                </div>
+                              </div>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </details>
+                ) : null}
+
+                {reviewStage === "modification" && review.deep_review ? (
+                  <section className="deep-review-result" aria-label="深度审查结论">
+                    <div className="deep-review-heading"><div><strong>深度审查结论：{review.deep_review.overall_conclusion}</strong><span>{review.deep_review.settings_note}</span></div><b>已完成</b></div>
+                    <p>{review.deep_review.executive_summary}</p>
+                    {review.deep_review.key_facts.length ? <details open><summary>关键条款与结论</summary><div className="deep-result-list">{review.deep_review.key_facts.map((fact, index) => <article key={`${fact.item}-${index}`}><b>{fact.item}</b><span>{fact.contract_term}</span><small>{fact.conclusion}</small></article>)}</div></details> : null}
+                    {review.deep_review.missing_clauses.length ? <details><summary>需补充的条款</summary><ul>{review.deep_review.missing_clauses.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
+                    {review.deep_review.negotiation_items.length ? <details><summary>谈判清单</summary><div className="deep-result-list">{review.deep_review.negotiation_items.map((item, index) => <article key={`${item.topic}-${index}`}><b>{item.topic} · {item.owner}</b><span>目标：{item.target}</span><small>底线：{item.minimum_acceptable}</small></article>)}</div></details> : null}
+                    {review.deep_review.clarification_questions.length ? <details><summary>待业务确认</summary><ul>{review.deep_review.clarification_questions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
+                  </section>
+                ) : null}
               </div>
             </section>
           </aside>
