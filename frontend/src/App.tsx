@@ -5,228 +5,24 @@ import Color from "@tiptap/extension-color";
 import Highlight from "@tiptap/extension-highlight";
 import { TextStyle } from "@tiptap/extension-text-style";
 import Underline from "@tiptap/extension-underline";
-import { ChangeEvent, FormEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getParagraphMatchScore,
   isMissingClause,
   MISSING_SENTINEL
 } from "./reviewUtils";
+import { useReviewWorkflow } from "./hooks/useReviewWorkflow";
+import { continueIntakeChat, getContractOverview } from "./api/legalApi";
+import { exportReviewedContract, recordReviewFeedback } from "./api/reviewActions";
+import { normalizeReviewResponse } from "./domain/reviewTransforms";
+import { ReviewJobStatus } from "./features/review/ReviewJobStatus";
+import { EditorPanel } from "./features/editor/EditorPanel";
+import { IntakePanel } from "./features/intake/IntakePanel";
+import { LegalAssistantMark } from "./features/intake/LegalAssistantMark";
+import { LegalUserMark } from "./features/intake/LegalUserMark";
+import { ReviewPanel } from "./features/review/ReviewPanel";
 
-type RiskLevel = "high" | "medium" | "low";
-type RiskFilter = "all" | RiskLevel | "pending" | "processed";
-
-type LawReference = {
-  label: string;
-  official_url?: string | null;
-  authority?: string | null;
-  effectiveness_status?: string | null;
-};
-
-type ReviewRisk = {
-  item: string;
-  level: RiskLevel;
-  original_text: string;
-  anchor_text?: string | null;
-  insert_after_text?: string | null;
-  risk: string;
-  suggestion: string;
-  laws?: string[];
-  source?: "model" | "rule" | "combined";
-  evidence_status: "verified" | "needs_manual_review";
-  law_references: LawReference[];
-  clause_reference?: string | null;
-  party_impact?: string | null;
-  negotiation_level?: "must_modify" | "negotiable" | "internal_approval" | "prohibited" | null;
-  minimum_acceptable_text?: string | null;
-};
-
-type ReviewCoverage = {
-  topic: string;
-  status: "checked" | "missing" | "uncertain";
-  evidence?: string | null;
-  method?: "model" | "rule" | "combined";
-};
-
-type ReviewConsistencyCheck = {
-  check: string;
-  status: "checked" | "warning" | "not_applicable";
-  evidence: string;
-  note: string;
-};
-
-type DocumentQuality = {
-  kind: "docx" | "pdf";
-  status: "searchable" | "partial" | "scanned" | "not_applicable";
-  pages?: number | null;
-  extracted_chars: number;
-  average_chars_per_page?: number | null;
-  ocr_detected: boolean;
-  note: string;
-};
-
-type DocumentPreflightCheck = {
-  category: "structure" | "scope" | "punctuation" | "typo";
-  title: string;
-  status: "passed" | "warning";
-  evidence: string;
-  suggestion: string;
-  original_text?: string | null;
-  replacement_text?: string | null;
-  auto_fixable?: boolean;
-};
-
-type PartyRole = "party_a" | "party_b" | "other";
-type ReviewStyle = "protective" | "balanced" | "material_only";
-type DeepReviewSettings = {
-  party_role: PartyRole;
-  other_party_role: string;
-  transaction_stage: string;
-  timeline_urgency: string;
-  counterparty_context: string;
-  deal_priorities: string[];
-  focus_areas: string[];
-  review_style: ReviewStyle;
-  contract_type: string;
-  special_requirements: string[];
-  business_context: string;
-  non_negotiables: string;
-  additional_notes: string[];
-};
-
-type DeepReviewOutput = {
-  state: "completed" | "needs_manual_review";
-  overall_conclusion: "可签" | "有条件可签" | "不建议签" | "待确认";
-  executive_summary: string;
-  key_facts: { item: string; contract_term: string; conclusion: string }[];
-  missing_clauses: string[];
-  negotiation_items: { topic: string; target: string; minimum_acceptable: string; owner: string }[];
-  clarification_questions: string[];
-  settings_note: string;
-};
-
-type ContractOverview = {
-  contract_type: string;
-  summary: string;
-  parties: string[];
-  transaction_subject: string;
-  key_terms: string[];
-  dimensions: { category: string; status: "stated" | "partial" | "not_found"; details: string[] }[];
-  business_flow: string[];
-  party_responsibilities: { party: string; responsibilities: string[] }[];
-  decision_points: { topic: string; contract_position: string; user_question: string }[];
-  clarification_questions: string[];
-  method: "model" | "fallback";
-  warnings: string[];
-};
-
-type ContractOverviewResponse = {
-  filename: string;
-  contract_text: string;
-  overview: ContractOverview;
-  document_quality?: DocumentQuality | null;
-};
-
-type IntakeChatMessage = {
-  role: "assistant" | "user";
-  content: string;
-  intent?: "intake" | "legal_research";
-  quick_replies?: string[];
-  suggested_questions?: string[];
-};
-
-type IntakeReviewCriteria = {
-  party_role: PartyRole | null;
-  other_party_role: string;
-  deal_priorities: string[];
-  focus_areas: string[];
-  review_style: ReviewStyle;
-  business_context: string;
-  non_negotiables: string;
-  special_requirements: string[];
-  additional_notes: string[];
-};
-
-type IntakeChatResponse = {
-  assistant_message: string;
-  quick_replies: string[];
-  suggested_questions: string[];
-  criteria: IntakeReviewCriteria;
-  ready_for_review: boolean;
-  source: "model" | "fallback";
-  warning?: string | null;
-};
-
-type LegalResearchResponse = {
-  assistant_message: string;
-  suggested_questions: string[];
-  source: "model" | "fallback";
-  warning?: string | null;
-};
-
-type ReviewResponse = {
-  filename: string;
-  contract_type?: string | null;
-  contract_text?: string | null;
-  risks: ReviewRisk[];
-  review_status: "complete" | "partial" | "needs_manual_review";
-  review_summary: string;
-  review_scope: string[];
-  coverage: ReviewCoverage[];
-  warnings: string[];
-  review_duration_ms?: number | null;
-  policy_version?: string;
-  review_method?: "model" | "rule" | "combined" | "manual";
-  manual_review_required?: boolean;
-  consistency_checks?: ReviewConsistencyCheck[];
-  document_quality?: DocumentQuality | null;
-  preflight_checks?: DocumentPreflightCheck[];
-  deep_review?: DeepReviewOutput | null;
-};
-
-type Modification = {
-  item?: string;
-  risk_key?: string;
-  original: string;
-  modified: string;
-  revision_id?: string;
-  anchor_text?: string | null;
-  insert_after_text?: string | null;
-  paragraph_context?: string | null;
-};
-
-type FeedbackDecision = "confirmed" | "rejected" | "edited";
-type PreflightDecision = "confirmed" | "deferred";
-
-type ParagraphOption = {
-  anchor: string;
-  label: string;
-};
-
-type RiskWithKey = {
-  risk: ReviewRisk;
-  riskKey: string;
-};
-
-type RiskLocationCandidate = {
-  paragraph: string;
-  paragraphIndex: number;
-  from: number;
-  to: number;
-  selectionFrom: number;
-  selectionTo: number;
-  score: number;
-  reason: "exact" | "anchor" | "similar";
-  exactOriginal: boolean;
-};
-
-type ReviewStage = "upload" | "intake" | "modification";
-// Retained while older intake helpers remain available for saved local state;
-// the visible workflow is now driven by IntakeChatMessage instead.
-type IntakeConversationStep = "role" | "objective" | "focus" | "redlines" | "ready";
-
-type DeepReviewFormSettings = Omit<DeepReviewSettings, "party_role"> & {
-  party_role: PartyRole | "";
-};
+import type { RiskLevel, RiskFilter, LawReference, ReviewRisk, ReviewCoverage, ReviewConsistencyCheck, DocumentQuality, DocumentPreflightCheck, PartyRole, ReviewStyle, DeepReviewSettings, DeepReviewOutput, ContractOverview, ContractOverviewResponse, IntakeChatMessage, IntakeReviewCriteria, IntakeChatResponse, ReviewResponse, Modification, FeedbackDecision, PreflightDecision, ParagraphOption, RiskWithKey, RiskLocationCandidate, ReviewStage, IntakeConversationStep, DeepReviewFormSettings } from "./domain/reviewTypes";
 
 const emptyIntakeCriteria: IntakeReviewCriteria = {
   party_role: null,
@@ -320,6 +116,7 @@ const levelOrder: Record<RiskLevel, number> = {
 
 const maxFileSizeMb = 10;
 const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
+const MANUAL_EDIT_COLOR = "#047455";
 const deepFocusOptions = ["主体与授权", "价格与付款", "交付与验收", "质量与售后", "数据与安全", "知识产权", "保密与宣传", "责任与赔偿", "变更管理", "解除与退出", "争议解决", "合规与许可", "全部"];
 const deepRequirementOptions = ["控制预付款", "付款与验收结果挂钩", "保留验收权", "限制责任", "不得单方调价或变更", "不得自动续约", "数据不出境", "数据删除与返还", "禁止 AI 训练", "禁止未经同意转包", "保留审计权", "争议在我方所在地", "保护品牌与宣传权", "源代码/材料可交付"];
 const dealPriorityOptions = ["按期上线或拿到可用成果", "预算可控，付款与结果挂钩", "保护数据、知识产权和商业秘密", "降低违约、售后与退出成本", "合规可审计、便于内部审批", "优先促成签约，保留必要保护"];
@@ -935,415 +732,6 @@ function removeRevisionMarkup(html: string, revisionId: string) {
   return container.innerHTML;
 }
 
-function apiHeaders() {
-  const headers: Record<string, string> = {
-    "X-Tenant-ID": import.meta.env.VITE_TENANT_ID || "local"
-  };
-  const apiToken = import.meta.env.VITE_API_AUTH_TOKEN;
-  if (apiToken) {
-    headers["X-API-Token"] = apiToken;
-  }
-  return headers;
-}
-
-async function getContractOverview(file: File): Promise<ContractOverviewResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
-  const response = await fetch("/api/overview", {
-    method: "POST",
-    headers: apiHeaders(),
-    body: formData
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Contract overview request failed with status ${response.status}.`);
-  }
-  const payload = await response.json() as Partial<ContractOverviewResponse>;
-  if (typeof payload.contract_text !== "string" || !payload.contract_text.trim() || !payload.overview) {
-    throw new Error("合同概览服务未返回可用的合同文本或概览内容。");
-  }
-  return {
-    filename: typeof payload.filename === "string" ? payload.filename : file.name,
-    contract_text: payload.contract_text.replace(unsupportedEditorCharacters, ""),
-    overview: {
-      contract_type: typeof payload.overview.contract_type === "string" ? payload.overview.contract_type : "待确认",
-      summary: typeof payload.overview.summary === "string" ? payload.overview.summary : "已读取合同，请确认我方身份与业务诉求。",
-      parties: Array.isArray(payload.overview.parties) ? payload.overview.parties.filter((item): item is string => typeof item === "string") : [],
-      transaction_subject: typeof payload.overview.transaction_subject === "string" ? payload.overview.transaction_subject : "待确认",
-      key_terms: Array.isArray(payload.overview.key_terms) ? payload.overview.key_terms.filter((item): item is string => typeof item === "string") : [],
-      dimensions: Array.isArray(payload.overview.dimensions) ? payload.overview.dimensions.flatMap((item) => {
-        if (!item || typeof item !== "object" || typeof item.category !== "string") return [];
-        const status = item.status === "stated" || item.status === "partial" || item.status === "not_found" ? item.status : "not_found";
-        return [{ category: item.category, status, details: Array.isArray(item.details) ? item.details.filter((detail): detail is string => typeof detail === "string") : [] }];
-      }) : [],
-      business_flow: Array.isArray(payload.overview.business_flow) ? payload.overview.business_flow.filter((item): item is string => typeof item === "string") : [],
-      party_responsibilities: Array.isArray(payload.overview.party_responsibilities) ? payload.overview.party_responsibilities.flatMap((item) => {
-        if (!item || typeof item !== "object" || typeof item.party !== "string") return [];
-        return [{ party: item.party, responsibilities: Array.isArray(item.responsibilities) ? item.responsibilities.filter((duty): duty is string => typeof duty === "string") : [] }];
-      }) : [],
-      decision_points: Array.isArray(payload.overview.decision_points) ? payload.overview.decision_points.flatMap((item) => {
-        if (!item || typeof item !== "object" || typeof item.topic !== "string") return [];
-        return [{ topic: item.topic, contract_position: typeof item.contract_position === "string" ? item.contract_position : "", user_question: typeof item.user_question === "string" ? item.user_question : "" }];
-      }) : [],
-      clarification_questions: Array.isArray(payload.overview.clarification_questions) ? payload.overview.clarification_questions.filter((item): item is string => typeof item === "string") : [],
-      method: payload.overview.method === "model" ? "model" : "fallback",
-      warnings: Array.isArray(payload.overview.warnings) ? payload.overview.warnings.filter((item): item is string => typeof item === "string") : []
-    },
-    document_quality: payload.document_quality ?? null
-  };
-}
-
-function normalizeIntakeCriteria(value: unknown): IntakeReviewCriteria {
-  if (!value || typeof value !== "object") return { ...emptyIntakeCriteria };
-  const source = value as Record<string, unknown>;
-  const list = (key: string, limit: number) => Array.isArray(source[key])
-    ? source[key].filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, limit)
-    : [];
-  return {
-    party_role: source.party_role === "party_a" || source.party_role === "party_b" || source.party_role === "other" ? source.party_role : null,
-    other_party_role: typeof source.other_party_role === "string" ? source.other_party_role : "",
-    deal_priorities: list("deal_priorities", 6),
-    focus_areas: list("focus_areas", 8),
-    review_style: source.review_style === "balanced" || source.review_style === "material_only" ? source.review_style : "protective",
-    business_context: typeof source.business_context === "string" ? source.business_context : "",
-    non_negotiables: typeof source.non_negotiables === "string" ? source.non_negotiables : "",
-    special_requirements: list("special_requirements", 8),
-    additional_notes: list("additional_notes", 5)
-  };
-}
-
-async function continueIntakeChat(
-  overview: ContractOverviewResponse,
-  messages: IntakeChatMessage[],
-  criteria: IntakeReviewCriteria,
-): Promise<IntakeChatResponse> {
-  const response = await fetch("/api/intake/chat", {
-    method: "POST",
-    headers: { ...apiHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contract_text: overview.contract_text,
-      overview: overview.overview,
-      messages: messages.map(({ role, content }) => ({ role, content })),
-      criteria
-    })
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `法务助手对话请求失败（${response.status}）。`);
-  }
-  const payload = await response.json() as Partial<IntakeChatResponse>;
-  if (typeof payload.assistant_message !== "string" || !payload.assistant_message.trim()) {
-    throw new Error("法务助手未返回下一步问题，请重试。");
-  }
-  return {
-    assistant_message: payload.assistant_message.trim(),
-    quick_replies: Array.isArray(payload.quick_replies)
-      ? payload.quick_replies.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
-      : [],
-    suggested_questions: Array.isArray(payload.suggested_questions)
-      ? payload.suggested_questions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
-      : [],
-    criteria: normalizeIntakeCriteria(payload.criteria),
-    ready_for_review: payload.ready_for_review === true,
-    source: payload.source === "model" ? "model" : "fallback",
-    warning: typeof payload.warning === "string" ? payload.warning : null
-  };
-}
-
-async function continueLegalResearch(
-  messages: IntakeChatMessage[],
-  contractContext?: string,
-): Promise<LegalResearchResponse> {
-  const response = await fetch("/api/legal-research/chat", {
-    method: "POST",
-    headers: { ...apiHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: messages.slice(-12).map(({ role, content }) => ({ role, content })),
-      contract_context: contractContext?.slice(0, 12_000) ?? "",
-    }),
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `法规咨询请求失败（${response.status}）。`);
-  }
-  const payload = await response.json() as Partial<LegalResearchResponse>;
-  if (typeof payload.assistant_message !== "string" || !payload.assistant_message.trim()) {
-    throw new Error("法规咨询未返回有效回答，请重试。");
-  }
-  return {
-    assistant_message: payload.assistant_message.trim(),
-    suggested_questions: Array.isArray(payload.suggested_questions)
-      ? payload.suggested_questions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4)
-      : [],
-    source: payload.source === "model" ? "model" : "fallback",
-    warning: typeof payload.warning === "string" ? payload.warning : null,
-  };
-}
-
-const legalResearchSignals = [
-  "法规", "法条", "法律", "条例", "办法", "规定", "司法解释", "民法典", "公司法", "劳动法",
-  "个人信息保护法", "数据安全法", "网络安全法", "知识产权", "法律依据", "第几条", "条文",
-];
-
-function isLegalResearchQuestion(content: string) {
-  const normalized = content.replace(/\s+/g, "");
-  return legalResearchSignals.some((signal) => normalized.includes(signal));
-}
-
-async function reviewContractDeeply(
-  filename: string,
-  contractText: string,
-  settings: DeepReviewSettings,
-  documentQuality?: DocumentQuality,
-): Promise<ReviewResponse> {
-  const response = await fetch("/api/review/deep", {
-    method: "POST",
-    headers: { ...apiHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ filename, contract_text: contractText, settings, document_quality: documentQuality ?? null })
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Deep review request failed with status ${response.status}.`);
-  }
-  return normalizeReviewResponse(await response.json(), filename);
-}
-
-function normalizeReviewResponse(payload: unknown, fallbackFilename: string): ReviewResponse {
-  if (!payload || typeof payload !== "object") {
-    throw new Error("审查服务返回了无法识别的数据。");
-  }
-
-  const source = payload as Record<string, unknown>;
-  if (typeof source.contract_text !== "string" || !source.contract_text.trim()) {
-    throw new Error("审查服务未返回可显示的合同正文。");
-  }
-
-  if (!Array.isArray(source.risks)) {
-    throw new Error("审查服务返回的风险列表格式不正确。");
-  }
-
-  const risks: ReviewRisk[] = source.risks.map((entry, index) => {
-    if (!entry || typeof entry !== "object") {
-      throw new Error(`第 ${index + 1} 条风险数据格式不正确。`);
-    }
-
-    const risk = entry as Record<string, unknown>;
-    const level = risk.level;
-    if (level !== "high" && level !== "medium" && level !== "low") {
-      throw new Error(`第 ${index + 1} 条风险缺少有效等级。`);
-    }
-
-    const requiredFields = ["item", "original_text", "risk", "suggestion"] as const;
-    for (const field of requiredFields) {
-      if (typeof risk[field] !== "string") {
-        throw new Error(`第 ${index + 1} 条风险缺少 ${field}。`);
-      }
-    }
-
-    const rawLaws = risk.laws;
-    const laws = Array.isArray(rawLaws)
-      ? rawLaws.filter((law): law is string => typeof law === "string")
-      : typeof rawLaws === "string"
-        ? [rawLaws]
-        : [];
-
-    return {
-      item: risk.item as string,
-      level,
-      original_text: risk.original_text as string,
-      anchor_text: typeof risk.anchor_text === "string" ? risk.anchor_text : null,
-      insert_after_text: typeof risk.insert_after_text === "string" ? risk.insert_after_text : null,
-      risk: risk.risk as string,
-      suggestion: risk.suggestion as string,
-      laws,
-      source: risk.source === "rule" || risk.source === "combined" ? risk.source : "model",
-      evidence_status: risk.evidence_status === "verified" ? "verified" : "needs_manual_review",
-      clause_reference: typeof risk.clause_reference === "string" ? risk.clause_reference : null,
-      party_impact: typeof risk.party_impact === "string" ? risk.party_impact : null,
-      negotiation_level: risk.negotiation_level === "must_modify" || risk.negotiation_level === "negotiable" || risk.negotiation_level === "internal_approval" || risk.negotiation_level === "prohibited"
-        ? risk.negotiation_level
-        : null,
-      minimum_acceptable_text: typeof risk.minimum_acceptable_text === "string" ? risk.minimum_acceptable_text : null,
-      law_references: Array.isArray(risk.law_references)
-        ? risk.law_references.flatMap((entry): LawReference[] => {
-            if (!entry || typeof entry !== "object") return [];
-            const item = entry as Record<string, unknown>;
-            if (typeof item.label !== "string") return [];
-            return [{
-              label: item.label,
-              official_url: typeof item.official_url === "string" ? item.official_url : null,
-              authority: typeof item.authority === "string" ? item.authority : null,
-              effectiveness_status: typeof item.effectiveness_status === "string" ? item.effectiveness_status : null,
-            }];
-          })
-        : []
-    };
-  });
-
-  const coverage = Array.isArray(source.coverage)
-    ? source.coverage.flatMap((entry): ReviewCoverage[] => {
-        if (!entry || typeof entry !== "object") return [];
-        const item = entry as Record<string, unknown>;
-        const status = item.status;
-        if (typeof item.topic !== "string" || (status !== "checked" && status !== "missing" && status !== "uncertain")) {
-          return [];
-        }
-        return [{
-          topic: item.topic,
-          status,
-          evidence: typeof item.evidence === "string" ? item.evidence : null,
-          method: item.method === "model" || item.method === "combined" ? item.method : "rule"
-        }];
-      })
-    : [];
-
-  return {
-    filename: typeof source.filename === "string" && source.filename ? source.filename : fallbackFilename,
-    contract_type: typeof source.contract_type === "string" ? source.contract_type : null,
-    contract_text: source.contract_text.replace(unsupportedEditorCharacters, ""),
-    risks,
-    review_status: source.review_status === "complete" || source.review_status === "partial" || source.review_status === "needs_manual_review"
-      ? source.review_status
-      : "needs_manual_review",
-    review_summary: typeof source.review_summary === "string" ? source.review_summary : "",
-    review_scope: Array.isArray(source.review_scope)
-      ? source.review_scope.filter((item): item is string => typeof item === "string")
-      : [],
-    coverage,
-    warnings: Array.isArray(source.warnings)
-      ? source.warnings.filter((item): item is string => typeof item === "string")
-      : [],
-    review_duration_ms: typeof source.review_duration_ms === "number" ? source.review_duration_ms : null,
-    policy_version: typeof source.policy_version === "string" ? source.policy_version : "2026.08",
-    review_method: source.review_method === "model" || source.review_method === "rule" || source.review_method === "manual"
-      ? source.review_method
-      : "combined",
-    manual_review_required: source.manual_review_required !== false,
-    consistency_checks: Array.isArray(source.consistency_checks)
-      ? source.consistency_checks.flatMap((entry): ReviewConsistencyCheck[] => {
-          if (!entry || typeof entry !== "object") return [];
-          const item = entry as Record<string, unknown>;
-          const status = item.status;
-          if (typeof item.check !== "string" || (status !== "checked" && status !== "warning" && status !== "not_applicable")) return [];
-          return [{
-            check: item.check,
-            status,
-            evidence: typeof item.evidence === "string" ? item.evidence : "",
-            note: typeof item.note === "string" ? item.note : "",
-          }];
-        })
-      : [],
-    document_quality: source.document_quality && typeof source.document_quality === "object"
-      ? (() => {
-          const item = source.document_quality as Record<string, unknown>;
-          const status = item.status;
-          if (item.kind !== "docx" && item.kind !== "pdf") return null;
-          if (status !== "searchable" && status !== "partial" && status !== "scanned" && status !== "not_applicable") return null;
-          return {
-            kind: item.kind,
-            status,
-            pages: typeof item.pages === "number" ? item.pages : null,
-            extracted_chars: typeof item.extracted_chars === "number" ? item.extracted_chars : 0,
-            average_chars_per_page: typeof item.average_chars_per_page === "number" ? item.average_chars_per_page : null,
-            ocr_detected: item.ocr_detected === true,
-            note: typeof item.note === "string" ? item.note : "",
-          };
-        })()
-      : null
-    , preflight_checks: Array.isArray(source.preflight_checks)
-      ? source.preflight_checks.flatMap((entry): DocumentPreflightCheck[] => {
-          if (!entry || typeof entry !== "object") return [];
-          const item = entry as Record<string, unknown>;
-          const category = item.category;
-          const checkStatus = item.status;
-          if (
-            (category !== "structure" && category !== "scope" && category !== "punctuation" && category !== "typo")
-            || (checkStatus !== "passed" && checkStatus !== "warning")
-            || typeof item.title !== "string"
-          ) return [];
-          return [{
-            category,
-            title: item.title,
-            status: checkStatus,
-            evidence: typeof item.evidence === "string" ? item.evidence : "",
-            suggestion: typeof item.suggestion === "string" ? item.suggestion : "",
-            original_text: typeof item.original_text === "string" ? item.original_text : null,
-            replacement_text: typeof item.replacement_text === "string" ? item.replacement_text : null,
-            auto_fixable: item.auto_fixable === true,
-          }];
-        })
-      : [],
-    deep_review: source.deep_review && typeof source.deep_review === "object"
-      ? (() => {
-          const item = source.deep_review as Record<string, unknown>;
-          const state = item.state;
-          const conclusion = item.overall_conclusion;
-          if ((state !== "completed" && state !== "needs_manual_review") || (conclusion !== "可签" && conclusion !== "有条件可签" && conclusion !== "不建议签" && conclusion !== "待确认")) return null;
-          const toStrings = (value: unknown) => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
-          const keyFacts = Array.isArray(item.key_facts) ? item.key_facts.flatMap((entry) => {
-            if (!entry || typeof entry !== "object") return [];
-            const fact = entry as Record<string, unknown>;
-            if (typeof fact.item !== "string") return [];
-            return [{ item: fact.item, contract_term: typeof fact.contract_term === "string" ? fact.contract_term : "", conclusion: typeof fact.conclusion === "string" ? fact.conclusion : "" }];
-          }) : [];
-          const negotiations = Array.isArray(item.negotiation_items) ? item.negotiation_items.flatMap((entry) => {
-            if (!entry || typeof entry !== "object") return [];
-            const negotiation = entry as Record<string, unknown>;
-            if (typeof negotiation.topic !== "string") return [];
-            return [{ topic: negotiation.topic, target: typeof negotiation.target === "string" ? negotiation.target : "", minimum_acceptable: typeof negotiation.minimum_acceptable === "string" ? negotiation.minimum_acceptable : "", owner: typeof negotiation.owner === "string" ? negotiation.owner : "法务/业务确认" }];
-          }) : [];
-          return { state, overall_conclusion: conclusion, executive_summary: typeof item.executive_summary === "string" ? item.executive_summary : "", key_facts: keyFacts, missing_clauses: toStrings(item.missing_clauses), negotiation_items: negotiations, clarification_questions: toStrings(item.clarification_questions), settings_note: typeof item.settings_note === "string" ? item.settings_note : "" };
-        })()
-      : null
-  };
-}
-
-async function exportReviewedContract(file: File, modifications: Modification[]) {
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("modifications", JSON.stringify(modifications));
-  formData.append("export_mode", "tracked");
-
-  const response = await fetch("/api/export", {
-    method: "POST",
-    headers: apiHeaders(),
-    body: formData
-  });
-
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Export request failed with status ${response.status}.`);
-  }
-
-  return {
-    blob: await response.blob(),
-    applied: Number(response.headers.get("X-Review-Applied-Modifications") ?? modifications.length),
-    skipped: Number(response.headers.get("X-Review-Skipped-Modifications") ?? 0),
-  };
-}
-
-async function recordReviewFeedback(
-  filename: string,
-  riskItem: string,
-  decision: FeedbackDecision,
-  correctedSuggestion?: string
-) {
-  const response = await fetch("/api/review/feedback", {
-    method: "POST",
-    headers: { ...apiHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      filename,
-      risk_item: riskItem,
-      decision,
-      corrected_suggestion: correctedSuggestion ?? null
-    })
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? "复核反馈记录失败。");
-  }
-}
-
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -1356,6 +744,7 @@ function downloadBlob(blob: Blob, filename: string) {
 }
 
 export default function App() {
+  const { activeJob, submitDeepReview } = useReviewWorkflow();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const highlightedParagraphRef = useRef<HTMLElement | null>(null);
   const insertionParagraphRef = useRef<HTMLElement | null>(null);
@@ -1408,6 +797,27 @@ export default function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [readerPanelHeight, setReaderPanelHeight] = useState<number | null>(null);
   const syncingEditorRef = useRef(false);
+  const editorTextSyncTimerRef = useRef<number | null>(null);
+  // Keep Tiptap as the source of truth while the user is typing.  In
+  // particular, Windows Chinese IMEs emit several intermediate transactions;
+  // synchronising React state for each one can interrupt the composition.
+  const scheduleEditorTextSync = useCallback((nextText: string, delay = 180) => {
+    if (editorTextSyncTimerRef.current !== null) {
+      window.clearTimeout(editorTextSyncTimerRef.current);
+    }
+    editorTextSyncTimerRef.current = window.setTimeout(() => {
+      editorTextSyncTimerRef.current = null;
+      if (!syncingEditorRef.current) {
+        setEditorText(nextText);
+      }
+    }, delay);
+  }, []);
+
+  useEffect(() => () => {
+    if (editorTextSyncTimerRef.current !== null) {
+      window.clearTimeout(editorTextSyncTimerRef.current);
+    }
+  }, []);
   // Every file/reset starts a new review session.  Long-running overview,
   // intake and deep-review calls keep the session number they started with so
   // an older response can never overwrite a newer contract's workspace.
@@ -1552,10 +962,12 @@ export default function App() {
       ],
       content: emptyEditorHtml,
       editable: true,
+      // The editor owns DOM updates.  React only needs the debounced plain
+      // text snapshot for risk matching and export, so avoid a render for each
+      // ProseMirror transaction.
+      shouldRerenderOnTransaction: false,
       onUpdate: ({ editor: updatedEditor }) => {
-        if (!syncingEditorRef.current) {
-          setEditorText(updatedEditor.getText());
-        }
+        if (!syncingEditorRef.current) scheduleEditorTextSync(updatedEditor.getText(), 420);
       },
       editorProps: {
         attributes: {
@@ -1574,6 +986,10 @@ export default function App() {
 
     editor.setOptions({
       editorProps: {
+        attributes: {
+          "aria-label": "合同正文编辑器",
+          class: "contract-editor"
+        },
         handleClick: (_view, _pos, event) => {
           const target = event.target;
           if (!(target instanceof HTMLElement)) {
@@ -1615,11 +1031,17 @@ export default function App() {
             setEditorNotice("当前段落对应多条风险，未自动选择风险卡；请在右侧手动核对。");
           }
 
+          window.setTimeout(() => {
+            if (!editor.isDestroyed && editor.isEditable && editor.state.selection.empty) {
+              editor.chain().setColor(MANUAL_EDIT_COLOR).run();
+            }
+          }, 0);
+
           return false;
         }
       }
     });
-  }, [editor, manualInsertRiskKey, risksWithKeys]);
+  }, [editor, manualInsertRiskKey, risksWithKeys, scheduleEditorTextSync]);
 
   useEffect(() => {
     if (!editor || editor.isDestroyed) {
@@ -2267,7 +1689,6 @@ export default function App() {
       const nextMessages = [...messages, {
         role: "assistant" as const,
         content: response.assistant_message,
-        intent: "intake" as const,
         quick_replies: response.quick_replies,
         suggested_questions: response.suggested_questions,
       }].slice(-12);
@@ -2301,54 +1722,18 @@ export default function App() {
     await startContractIntake(file);
   }
 
-  async function requestLegalResearchAssistant(
-    messages: IntakeChatMessage[],
-    workflowEpoch = workflowEpochRef.current,
-  ) {
-    setIsIntakeChatLoading(true);
-    setIntakeChatWarning(null);
-    try {
-      const response = await continueLegalResearch(
-        messages.filter((message) => message.intent === "legal_research").slice(-12),
-        contractOverview ? `${contractOverview.overview.summary}\n\n${contractOverview.contract_text}` : undefined,
-      );
-      if (workflowEpochRef.current !== workflowEpoch) return;
-      setIntakeMessages((current) => [...current, {
-        role: "assistant" as const,
-        content: response.assistant_message,
-        intent: "legal_research" as const,
-        suggested_questions: response.suggested_questions,
-      }].slice(-12));
-      setIntakeChatWarning(response.warning ?? null);
-      setError(null);
-    } catch (chatError) {
-      if (workflowEpochRef.current !== workflowEpoch) return;
-      setError(getErrorMessage(chatError));
-      setIntakeChatWarning("法规咨询暂时没有回应。您可以重试；合同和既定审核方案不会改变。");
-    } finally {
-      if (workflowEpochRef.current === workflowEpoch) {
-        setIsIntakeChatLoading(false);
-      }
-    }
-  }
-
-  async function submitIntakeChatAnswer(answer: string, preferredIntent?: "intake" | "legal_research") {
+  async function submitIntakeChatAnswer(answer: string) {
     if (isIntakeChatLoading) return;
     const content = answer.trim();
     if (!content) return;
-    const lastAssistant = [...intakeMessages].reverse().find((message) => message.role === "assistant");
-    const intent = preferredIntent
-      ?? (!contractOverview || isLegalResearchQuestion(content) || lastAssistant?.intent === "legal_research" ? "legal_research" : "intake");
-    const nextMessages = [...intakeMessages, { role: "user" as const, content, intent }].slice(-12);
-    setIntakeMessages(nextMessages);
-    setIntakeChatDraft("");
-    if (intent === "legal_research") {
-      await requestLegalResearchAssistant(nextMessages, workflowEpochRef.current);
+    if (!contractOverview) {
+      setError("请先上传 DOCX 或 PDF 合同；本页面仅用于围绕已上传合同确定审查方向和完成审核。");
       return;
     }
-    if (contractOverview) {
-      await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria, workflowEpochRef.current);
-    }
+    const nextMessages = [...intakeMessages, { role: "user" as const, content }].slice(-12);
+    setIntakeMessages(nextMessages);
+    setIntakeChatDraft("");
+    await requestIntakeAssistant(contractOverview, nextMessages, intakeCriteria, workflowEpochRef.current);
   }
 
   async function sendIntakeChatMessage(event?: FormEvent) {
@@ -2387,12 +1772,15 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const result = await reviewContractDeeply(
-        contractOverview.filename,
-        contractOverview.contract_text,
-        settingsForReview as DeepReviewSettings,
-        contractOverview.document_quality ?? undefined,
-      );
+      setEditorNotice("深度审查任务已排队，系统会持续查询执行结果…");
+      const completedJob = await submitDeepReview(contractOverview, settingsForReview);
+      if (completedJob.status === "failed") {
+        throw new Error(completedJob.error ?? "深度审查任务执行失败，请重试。");
+      }
+      if (!completedJob.result) {
+        throw new Error("深度审查任务未返回结果，请重试。");
+      }
+      const result = normalizeReviewResponse(completedJob.result, contractOverview.filename);
       if (workflowEpochRef.current !== workflowEpoch) return;
       if (!result.deep_review || result.deep_review.state !== "completed" || !result.deep_review.executive_summary.trim()) {
         throw new Error("深度审查未返回完整的审查说明，系统未开放修改与导出。");
@@ -2474,8 +1862,11 @@ export default function App() {
       return;
     }
 
-    const editorModifications = review?.contract_text && editorText !== review.contract_text
-      ? buildEditorModifications(review.contract_text, editorText)
+    // Read directly from Tiptap here: a click on Export can occur before the
+    // short UI-sync debounce has fired, and must never omit the last edit.
+    const currentEditorText = editor?.isDestroyed ? editorText : (editor?.getText() ?? editorText);
+    const editorModifications = review?.contract_text && currentEditorText !== review.contract_text
+      ? buildEditorModifications(review.contract_text, currentEditorText)
       : [];
     const exportModifications = collectExportModifications(modifications, editorModifications);
 
@@ -2507,7 +1898,7 @@ export default function App() {
 
   const renderIntakeWorkspace = () => (
     <section
-      className="legal-chat-shell legal-chat-shell-openc"
+      className={`legal-chat-shell legal-chat-shell-openc${!file && !contractOverview && intakeMessages.length === 0 ? " legal-chat-shell-empty" : ""}`}
       aria-busy={isLoading || isIntakeChatLoading}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
@@ -2520,17 +1911,17 @@ export default function App() {
       <div className="legal-chat-timeline" aria-live="polite" ref={intakeTimelineRef}>
         {!contractOverview ? (
           <section className="legal-chat-welcome" aria-label="开始合同审查">
-            <h1>今天需要处理什么法律问题？</h1>
-            <p>上传 Word 或 PDF 可开始合同审查；也可直接咨询法规、法条与合同条款问题。</p>
+            <h1>今天需要审查什么合同？</h1>
+            <p>上传 Word 或 PDF 合同，AI 会先阅读原文，再通过简短对话确认您的身份、目标与底线。</p>
           </section>
         ) : null}
 
         {!contractOverview ? (
           <article className="legal-chat-message legal-chat-message-assistant">
-            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <LegalAssistantMark />
             <div className="legal-chat-message-body">
               <b>AI 法务助手</b>
-              <p>{file ? "合同已加入会话，正在读取并提炼合同内容，随后开始确认审查方向。" : "您可以直接咨询法规、法条与合同问题；上传合同后，我会在不改变既定审查方案的前提下继续协助。"}</p>
+              <p>{file ? "合同已加入会话，正在读取并提炼合同内容，随后开始确认审查方向。" : "请先上传需要审查的合同。我会围绕合同原文与您确认审查立场、业务目标和不可让步条件。"}</p>
             </div>
           </article>
         ) : null}
@@ -2550,14 +1941,14 @@ export default function App() {
 
         {isLoading && !contractOverview ? (
           <article className="legal-chat-message legal-chat-message-assistant legal-chat-message-working">
-            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <LegalAssistantMark thinking />
             <div className="legal-chat-message-body"><b>AI 法务助手</b><p>正在解析合同、识别交易结构并准备第一个问题…</p></div>
           </article>
         ) : null}
 
         {contractOverview ? (
           <article className="legal-chat-message legal-chat-message-assistant">
-            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
+            <LegalAssistantMark />
             <div className="legal-chat-message-body legal-chat-overview-message">
               <b>合同已读取 · {contractOverview.overview.contract_type || "待确认合同类型"}</b>
               <p>{contractOverview.overview.summary}</p>
@@ -2579,9 +1970,9 @@ export default function App() {
             : [];
           return (
             <article className={`legal-chat-message legal-chat-message-${message.role}`} key={`${message.role}-${index}-${message.content.slice(0, 20)}`}>
-              {message.role === "assistant" ? <span className="legal-chat-message-avatar" aria-hidden="true">AI</span> : null}
+              {message.role === "assistant" ? <LegalAssistantMark /> : null}
               <div className="legal-chat-message-body">
-                <b>{message.role === "assistant" ? "AI 法务助手" : "您"}</b>
+                {message.role === "assistant" ? <b>AI 法务助手</b> : null}
                 <p>{message.content}</p>
                 {quickReplies.length ? (
                   <div className="legal-chat-quick-replies" aria-label="快捷回答">
@@ -2615,14 +2006,15 @@ export default function App() {
                   </div>
                 ) : null}
               </div>
+              {message.role === "user" ? <LegalUserMark /> : null}
             </article>
           );
         })}
 
         {isIntakeChatLoading ? (
           <article className="legal-chat-message legal-chat-message-assistant legal-chat-message-working">
-            <span className="legal-chat-message-avatar" aria-hidden="true">AI</span>
-            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>{intakeMessages[intakeMessages.length - 1]?.intent === "legal_research" ? "正在整理法规信息与合同提示…" : "正在理解您的诉求并更新审核方案…"}</p></div>
+            <LegalAssistantMark thinking />
+            <div className="legal-chat-message-body"><b>AI 法务助手</b><p>正在理解您的诉求并更新审核方案…</p></div>
           </article>
         ) : null}
 
@@ -2648,63 +2040,20 @@ export default function App() {
         ) : null}
       </div>
 
-      <div className="legal-chat-dock">
-        {intakeChatWarning ? <p className="legal-chat-notice" role="status">{intakeChatWarning}</p> : null}
-        {error ? <p className="error-message legal-chat-error">{error}</p> : null}
-        <form
-          className="legal-chat-composer"
-          onSubmit={(event) => {
-            if (contractOverview) {
-              void sendIntakeChatMessage(event);
-              return;
-            }
-            event.preventDefault();
-            if (intakeChatDraft.trim()) void sendIntakeChatMessage();
-            else if (!file) fileInputRef.current?.click();
-          }}
-        >
-          <textarea
-            value={intakeChatDraft}
-            maxLength={2000}
-            disabled={isIntakeChatLoading || isLoading}
-            onChange={(event) => setIntakeChatDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || !intakeChatDraft.trim()) return;
-              event.preventDefault();
-              void sendIntakeChatMessage();
-            }}
-            placeholder={contractOverview ? "告诉 AI 您的立场、业务目标、顾虑，或直接查询相关法规…" : file ? "正在自动读取合同…" : "咨询法规、法条或合同问题；也可通过左侧上传文件"}
-          />
-          <div className="legal-chat-composer-actions">
-            <div className="legal-chat-composer-left-actions">
-              <button className="legal-chat-attach" type="button" disabled={isLoading || isIntakeChatLoading} onClick={() => fileInputRef.current?.click()}>
-                上传文件
-              </button>
-              <button
-                className="legal-chat-stop"
-                type="button"
-                disabled={!isLoading && !isIntakeChatLoading && !intakeChatDraft.trim() && intakeMessages[intakeMessages.length - 1]?.role !== "user"}
-                onClick={stopIntakeDraft}
-                title="终止当前输入或正在生成的回复"
-              >
-                终止
-              </button>
-            </div>
-            <button
-              className="legal-chat-send"
-              type="submit"
-              title="Enter"
-              aria-label="Enter"
-              disabled={isLoading || isIntakeChatLoading || !intakeChatDraft.trim()}
-            >
-              {isIntakeChatLoading ? "…" : "Enter"}
-            </button>
-          </div>
-        </form>
-        <div className="legal-chat-dock-footer">
-          <span>支持 DOCX / PDF，最大 10MB · 合同内容仅用于本次审查</span>
-        </div>
-      </div>
+      <IntakePanel
+        contractOverview={contractOverview}
+        file={file}
+        isLoading={isLoading}
+        isIntakeChatLoading={isIntakeChatLoading}
+        intakeChatDraft={intakeChatDraft}
+        intakeChatWarning={intakeChatWarning}
+        error={error}
+        isBusy={isLoading || isIntakeChatLoading || intakeMessages[intakeMessages.length - 1]?.role === "user"}
+        fileInputRef={fileInputRef}
+        onDraftChange={setIntakeChatDraft}
+        onSend={(event) => void sendIntakeChatMessage(event)}
+        onStop={stopIntakeDraft}
+      />
     </section>
   );
 
@@ -2720,7 +2069,7 @@ export default function App() {
             onChange={handleFileChange}
           />
 
-          {!review ? renderIntakeWorkspace() : (
+          {!review ? <>{renderIntakeWorkspace()}</> : (
         <section
           className={`workspace robin-review-workspace${isSidebarCollapsed ? " workspace-collapsed" : ""}`}
           aria-busy={isLoading}
@@ -2768,54 +2117,20 @@ export default function App() {
                 <p>正在解析合同、检索法规并生成审查意见…</p>
               </div>
             ) : null}
+            <ReviewJobStatus job={activeJob} />
 
             {error ? <p className="error-message">{error}</p> : null}
-            <section className="editor-panel editor-panel-promoted" aria-label="合同正文编辑">
-              <div className="editor-heading">
-                <div>
-                  <h2>合同正文</h2>
-                </div>
-                <span>{editorText ? `${editorText.length} 字` : "未载入"}</span>
-              </div>
-
-              {manualInsertRiskKey ? (
-                <div className="editor-mode-banner" role="status" aria-live="polite">
-                  正在手动选择插入位置：点击正文中的目标段落，补充条款会插入到该段后面。
-                </div>
-              ) : null}
-
-              {reviewStage !== "modification" ? (
-                <div className="modification-locked-banner" role="status">
-                  正在完成综合审查，正文修改与最终导出将在结果生成后开放。
-                </div>
-              ) : null}
-
-              <div className="editor-toolbar" role="toolbar" aria-label="正文格式工具">
-                <button type="button" title="加粗" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleBold().run()}><strong>B</strong></button>
-                <button type="button" title="斜体" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleItalic().run()}><em>I</em></button>
-                <button type="button" title="下划线" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleUnderline().run()}><u>U</u></button>
-                <button type="button" className="highlight-tool" title="黄色高亮" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().toggleHighlight({ color: "#fff19a" }).run()}>A</button>
-                <button type="button" className="text-color-tool" title="绿色文字" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().setColor("#146b49").run()}>A</button>
-                <button type="button" className="clear-format-tool" title="清除文字格式" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().unsetAllMarks().run()}>清除格式</button>
-                <span className="toolbar-divider" aria-hidden="true" />
-                <button type="button" title="撤销" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().undo().run()}>↶</button>
-                <button type="button" title="重做" onMouseDown={(event) => event.preventDefault()} onClick={() => editor?.chain().focus().redo().run()}>↷</button>
-              </div>
-
-              <div className={`editor-page editor-page-promoted${isSidebarCollapsed ? " editor-page-focus" : ""}`}>
-                <EditorContent editor={editor} />
-              </div>
-
-              <div className="export-row">
-                <div>
-                  <strong>{modifications.length}</strong>
-                  <span>条已接受修改</span>
-                </div>
-                <button className="primary-button" type="button" disabled={reviewStage !== "modification" || !canExport} onClick={() => void handleExport()}>
-                  {isExporting ? "导出中" : "导出 Word 审阅版"}
-                </button>
-              </div>
-            </section>
+            <EditorPanel
+              editor={editor}
+              editorText={editorText}
+              manualInsertRiskKey={manualInsertRiskKey}
+              reviewStage={reviewStage}
+              isSidebarCollapsed={isSidebarCollapsed}
+              modifications={modifications}
+              canExport={canExport}
+              isExporting={isExporting}
+              onExport={() => void handleExport()}
+            />
           </section>
 
           <aside className={`review-sidebar robin-review-sidebar${isSidebarCollapsed ? " review-sidebar-collapsed" : ""}`}>
@@ -3200,16 +2515,7 @@ export default function App() {
                   </details>
                 ) : null}
 
-                {reviewStage === "modification" && review.deep_review ? (
-                  <section className="deep-review-result" aria-label="深度审查结论">
-                    <div className="deep-review-heading"><div><strong>深度审查结论：{review.deep_review.overall_conclusion}</strong><span>{review.deep_review.settings_note}</span></div><b>已完成</b></div>
-                    <p>{review.deep_review.executive_summary}</p>
-                    {review.deep_review.key_facts.length ? <details open><summary>关键条款与结论</summary><div className="deep-result-list">{review.deep_review.key_facts.map((fact, index) => <article key={`${fact.item}-${index}`}><b>{fact.item}</b><span>{fact.contract_term}</span><small>{fact.conclusion}</small></article>)}</div></details> : null}
-                    {review.deep_review.missing_clauses.length ? <details><summary>需补充的条款</summary><ul>{review.deep_review.missing_clauses.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
-                    {review.deep_review.negotiation_items.length ? <details><summary>谈判清单</summary><div className="deep-result-list">{review.deep_review.negotiation_items.map((item, index) => <article key={`${item.topic}-${index}`}><b>{item.topic} · {item.owner}</b><span>目标：{item.target}</span><small>底线：{item.minimum_acceptable}</small></article>)}</div></details> : null}
-                    {review.deep_review.clarification_questions.length ? <details><summary>待业务确认</summary><ul>{review.deep_review.clarification_questions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
-                  </section>
-                ) : null}
+                <ReviewPanel deepReview={review.deep_review} reviewStage={reviewStage} />
               </div>
             </section>
           </aside>

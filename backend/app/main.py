@@ -1,6 +1,7 @@
 import os
 import json
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,8 +17,6 @@ from app.schemas.review import (
     DocumentQuality,
     IntakeChatRequest,
     IntakeChatResponse,
-    LegalResearchRequest,
-    LegalResearchResponse,
     ReviewFeedback,
     ReviewResponse,
     TextReviewRequest,
@@ -34,9 +33,10 @@ from app.services.openai_review import review_contract_text
 from app.services.deep_review import review_contract_deeply
 from app.services.contract_overview import create_contract_overview
 from app.services.intake_chat import continue_intake_chat
-from app.services.legal_research_chat import continue_legal_research_chat
 from app.services.review_report import render_review_report
 from app.services.request_auth import require_request_identity
+from app.services.review_jobs import ReviewJob, ReviewJobStore, ReviewJobWorker
+from app.core.runtime import review_job_runtime_config
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 API_VERSION = "2026.08.18-chat-intake"
@@ -55,9 +55,21 @@ PDF_QUALITY_NOTES = {
     "scanned": "PDF 疑似扫描件，当前仅识别到少量文本，需要 OCR 后复核。",
 }
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Own the review worker lifecycle without relying on deprecated events."""
+    start_review_job_worker()
+    try:
+        yield
+    finally:
+        stop_review_job_worker()
+
+
 app = FastAPI(
     title="Legal AI Platform API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -76,6 +88,83 @@ app.add_middleware(
         "X-Review-Skipped-Modifications",
     ],
 )
+
+
+def job_runtime_config() -> dict[str, object]:
+    """Backward-compatible API for callers of the original application module."""
+    return review_job_runtime_config()
+
+
+def _review_job_store() -> ReviewJobStore:
+    config = job_runtime_config()
+    path = str(config["path"])
+    current = getattr(app.state, "review_job_store", None)
+    if current is None or str(current.path) != str(Path(path)):
+        current = ReviewJobStore(path)
+        app.state.review_job_store = current
+    return current
+
+
+def _apply_document_quality(review: ReviewResponse, document_quality: DocumentQuality | None) -> ReviewResponse:
+    """Keep synchronous and queued deep-review responses semantically identical."""
+    review.document_quality = document_quality
+    if document_quality and document_quality.status in {"partial", "scanned"}:
+        review.warnings = list(dict.fromkeys([
+            *review.warnings,
+            document_quality.note or "文档文本提取不完整，审查结论需要结合原件人工复核。",
+        ]))
+        review.manual_review_required = True
+        if review.review_status == "complete":
+            review.review_status = "partial"
+    return review
+
+
+def _execute_deep_review_job(request: dict[str, object]) -> dict[str, object]:
+    """Execute persisted job payloads with the same validation as the API route."""
+    parsed = DeepReviewRequest.model_validate(request)
+    review = review_contract_deeply(
+        contract_text=parsed.contract_text,
+        filename=parsed.filename,
+        settings=parsed.settings,
+    )
+    return _apply_document_quality(review, parsed.document_quality).model_dump(mode="json")
+
+
+def _job_summary(job: ReviewJob) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "job_id": job.job_id,
+        "job_type": job.job_type,
+        "status": job.status,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "updated_at": job.updated_at,
+        "attempt_count": job.attempt_count,
+    }
+    if job.status == "succeeded":
+        summary["result"] = job.result
+    if job.status == "failed":
+        summary["error"] = job.error
+    return summary
+
+
+def start_review_job_worker() -> None:
+    store = _review_job_store()
+    store.recover_running_jobs()
+    config = job_runtime_config()
+    store.cleanup_expired(int(config["retention_days"]))
+    enabled = os.getenv("REVIEW_JOB_WORKER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    if enabled:
+        worker = ReviewJobWorker(store, _execute_deep_review_job, poll_seconds=float(config["poll_seconds"]))
+        worker.start()
+        app.state.review_job_worker = worker
+
+
+def stop_review_job_worker() -> None:
+    worker = getattr(app.state, "review_job_worker", None)
+    if worker is not None:
+        worker.stop()
+        app.state.review_job_worker = None
 
 
 @app.get("/health")
@@ -312,15 +401,33 @@ async def continue_intake_conversation(
     return await run_in_threadpool(continue_intake_chat, request)
 
 
-@app.post("/api/legal-research/chat", response_model=LegalResearchResponse)
-async def continue_legal_research_conversation(
-    request: LegalResearchRequest,
+@app.post("/api/review-jobs", status_code=status.HTTP_202_ACCEPTED)
+async def create_review_job(
+    request: DeepReviewRequest,
     x_api_token: str | None = Header(default=None),
     x_tenant_id: str | None = Header(default=None),
-) -> LegalResearchResponse:
-    """Answer general legal questions without changing the contract review plan."""
-    require_request_identity(x_api_token, x_tenant_id)
-    return await run_in_threadpool(continue_legal_research_chat, request)
+) -> dict[str, object]:
+    """Queue a deep review so a page refresh cannot discard long model work."""
+    tenant_id = require_request_identity(x_api_token, x_tenant_id)
+    job = _review_job_store().create_job(
+        tenant_id=tenant_id,
+        job_type="deep_review",
+        request=request.model_dump(mode="json"),
+    )
+    return _job_summary(job)
+
+
+@app.get("/api/review-jobs/{job_id}")
+async def get_review_job(
+    job_id: str,
+    x_api_token: str | None = Header(default=None),
+    x_tenant_id: str | None = Header(default=None),
+) -> dict[str, object]:
+    tenant_id = require_request_identity(x_api_token, x_tenant_id)
+    job = _review_job_store().get_job(job_id, tenant_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review job not found.")
+    return _job_summary(job)
 
 
 @app.post("/api/review/text", response_model=ReviewResponse)
@@ -367,16 +474,7 @@ async def review_contract_deep_stage(
         filename=request.filename,
         settings=request.settings,
     )
-    review.document_quality = request.document_quality
-    if request.document_quality and request.document_quality.status in {"partial", "scanned"}:
-        review.warnings = list(dict.fromkeys([
-            *review.warnings,
-            request.document_quality.note or "文档文本提取不完整，审查结论需要结合原件人工复核。",
-        ]))
-        review.manual_review_required = True
-        if review.review_status == "complete":
-            review.review_status = "partial"
-    return review
+    return _apply_document_quality(review, request.document_quality)
 
 
 @app.post("/api/export")

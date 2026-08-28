@@ -634,6 +634,28 @@ h1 {
   line-height: 1.5;
 }
 
+.review-job-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.65rem 0;
+  color: #37685a;
+  font-size: 0.84rem;
+}
+
+.review-job-status-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: currentColor;
+  animation: review-job-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes review-job-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
 .error-message {
   border: 1px solid rgb(180 35 24 / 18%);
   background: var(--danger-soft);
@@ -6420,5 +6442,347 @@ body {
   #root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-attach,
   #root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-stop {
     padding: 0 10px;
+  }
+}
+
+/* Composer action lock: upload is a compact secondary action, while the
+   right-hand action switches between send and stop in the same position. */
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-attach {
+  display: grid;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid #dedede;
+  border-radius: 50%;
+  color: #666b70;
+  background: #f0f1f2;
+}
+
+.legal-chat-attach-icon {
+  position: relative;
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.legal-chat-attach-icon::before,
+.legal-chat-attach-icon::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+}
+
+.legal-chat-attach-icon::before {
+  width: 12px;
+  height: 1.5px;
+  transform: translate(-50%, -50%);
+}
+
+.legal-chat-attach-icon::after {
+  width: 1.5px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-attach:hover:not(:disabled) {
+  border-color: #c9cbcd;
+  color: #34383c;
+  background: #e6e7e8;
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send-stop,
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send-stop:hover:not(:disabled) {
+  border-color: #202020;
+  color: #fff;
+  background: #202020;
+}
+
+/* Refined legal-assistant identity and focused chat composition. */
+.legal-chat-shell-openc {
+  --legal-ink: #203342;
+  --legal-accent: #2f6673;
+  --legal-accent-hover: #255460;
+  --legal-accent-soft: #edf5f6;
+  --legal-accent-border: #9bb8bf;
+}
+
+#root .legal-chat-shell-openc .legal-chat-timeline,
+#root .legal-chat-shell-openc .legal-chat-dock {
+  padding-right: max(24px, calc((100% - 960px) / 2));
+  padding-left: max(24px, calc((100% - 960px) / 2));
+}
+
+#root .legal-chat-shell-openc .legal-chat-timeline {
+  gap: 20px;
+  padding-top: 48px;
+}
+
+#root .legal-chat-shell-empty {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+#root .legal-chat-shell-empty .legal-chat-timeline {
+  padding-bottom: 20px;
+  overflow: visible;
+}
+
+#root .legal-chat-shell-empty .legal-chat-dock {
+  align-self: start;
+  padding-top: 24px;
+}
+
+.legal-chat-welcome {
+  width: 100%;
+  max-width: 960px;
+  justify-items: start;
+  align-self: flex-start;
+  gap: 8px;
+  padding: 0 0 16px;
+  text-align: left;
+}
+
+.legal-chat-welcome h1 {
+  max-width: 11em;
+  color: var(--legal-ink);
+  font-size: clamp(2rem, 4vw, 2.7rem);
+  line-height: 1.08;
+}
+
+.legal-chat-welcome > p {
+  max-width: 680px;
+  margin-bottom: 0;
+  font-size: 0.94rem;
+}
+
+#root .legal-chat-shell-openc .legal-chat-message {
+  max-width: 960px;
+  gap: 12px;
+}
+
+#root .legal-chat-shell-openc .legal-chat-message-body {
+  max-width: min(760px, calc(100% - 48px));
+}
+
+#root .legal-chat-shell-openc .legal-chat-message-body > b {
+  color: #4d6872;
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+#root .legal-chat-shell-openc .legal-chat-message-body p {
+  color: #263943;
+  font-size: 0.94rem;
+  line-height: 1.72;
+}
+
+.legal-assistant-mark {
+  position: relative;
+  display: grid;
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  margin-top: 1px;
+  place-items: center;
+  overflow: visible;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+}
+
+.legal-assistant-robot-image {
+  display: block;
+  width: 42px;
+  max-width: none;
+  height: 42px;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 7px rgb(18 20 22 / 16%));
+}
+
+.legal-assistant-mark::before {
+  position: absolute;
+  inset: -4px;
+  border: 1.5px solid transparent;
+  border-top-color: #17191b;
+  border-right-color: #9ca1a5;
+  border-radius: 50%;
+  opacity: 0;
+  content: "";
+}
+
+.legal-assistant-mark-thinking::before {
+  opacity: 1;
+  animation: legal-assistant-orbit 1.15s linear infinite;
+}
+
+.legal-assistant-mark-thinking .legal-assistant-robot-image {
+  animation: legal-assistant-robot-bob 1.45s ease-in-out infinite;
+}
+
+.legal-user-mark {
+  display: grid;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  margin-top: 1px;
+  place-items: center;
+  border: 1px solid #dbe2e5;
+  border-radius: 50%;
+  color: #607985;
+  background: #f4f6f7;
+  box-shadow: 0 3px 8px rgb(24 42 52 / 8%);
+}
+
+.legal-user-mark svg {
+  width: 17px;
+  height: 17px;
+}
+
+.legal-chat-starters {
+  display: grid;
+  width: min(760px, calc(100% - 46px));
+  margin-left: 46px;
+  gap: 10px;
+}
+
+.legal-chat-starters > span {
+  color: #858a8f;
+  font-size: 0.72rem;
+}
+
+.legal-chat-starters > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.legal-chat-starters button {
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid #dedfe1;
+  border-radius: 10px;
+  color: #41464b;
+  background: #f7f7f8;
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.legal-chat-starters button:hover {
+  border-color: var(--legal-accent-border);
+  color: var(--legal-accent-hover);
+  background: var(--legal-accent-soft);
+}
+
+.legal-chat-starters button:active {
+  transform: translateY(1px);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer {
+  min-height: 106px;
+  border-color: #d5d7d9;
+  border-radius: 20px;
+  box-shadow: 0 12px 34px rgb(28 32 35 / 8%);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer:focus-within {
+  border-color: var(--legal-accent-border);
+  box-shadow: 0 14px 38px rgb(47 102 115 / 13%);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send {
+  display: grid;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--legal-accent);
+  box-shadow: 0 4px 14px rgb(47 102 115 / 24%);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send:hover:not(:disabled) {
+  color: #fff;
+  background: var(--legal-accent-hover);
+  transform: translateY(-1px);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send:disabled {
+  border-color: #dedfe1;
+  color: #9ca0a4;
+  background: #eceeef;
+  box-shadow: none;
+}
+
+.legal-chat-send-glyph {
+  font-size: 1.12rem;
+  font-weight: 650;
+  line-height: 1;
+}
+
+#root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send-stop .legal-chat-send-glyph {
+  font-size: 0.64rem;
+}
+
+@keyframes legal-assistant-orbit {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes legal-assistant-robot-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-1px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .legal-assistant-mark-thinking::before,
+  .legal-assistant-mark-thinking .legal-assistant-robot-image {
+    animation: none;
+  }
+
+  .legal-chat-starters button,
+  #root .legal-chat-shell-openc .legal-chat-composer-actions .legal-chat-send {
+    transition: none;
+  }
+}
+
+@media (max-width: 640px) {
+  #root .legal-chat-shell-openc .legal-chat-timeline,
+  #root .legal-chat-shell-openc .legal-chat-dock {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  #root .legal-chat-shell-openc .legal-chat-timeline {
+    padding-top: 28px;
+  }
+
+  .legal-chat-welcome h1 {
+    font-size: 1.85rem;
+  }
+
+  .legal-chat-starters {
+    width: calc(100% - 46px);
+  }
+
+  .legal-chat-starters > div {
+    flex-wrap: nowrap;
+    padding-bottom: 4px;
+    overflow-x: auto;
+  }
+
+  .legal-chat-starters button {
+    flex: 0 0 auto;
   }
 }

@@ -190,7 +190,35 @@ def test_paragraph_reference_recovers_an_exact_source_anchor() -> None:
     assert any("段落编号" in warning for warning in hydrated.warnings)
 
 
-def test_quote_repair_only_accepts_verbatim_text_from_the_source_paragraph(monkeypatch) -> None:
+def test_paragraph_reference_derives_quote_from_verified_offsets() -> None:
+    paragraph = "乙方仅赔偿经证明的直接损失，不承担任何间接损失。"
+    quote = "仅赔偿经证明的直接损失"
+    start = paragraph.index(quote)
+    review = ReviewResponse(
+        filename="contract.docx",
+        risks=[
+            ReviewRisk(
+                item="责任限制",
+                level="high",
+                original_text="乙方责任范围过窄",
+                clause_reference="P001",
+                quote_start=start,
+                quote_end=start + len(quote),
+                risk="责任范围过窄。",
+                suggestion="乙方应承担全部可证明损失。",
+            )
+        ],
+    )
+
+    hydrated = openai_review.hydrate_review_clause_references(review, {"P001": paragraph})
+
+    assert hydrated.risks[0].original_text == quote
+    assert hydrated.risks[0].anchor_text == paragraph
+    assert hydrated.risks[0].quote_start == start
+    assert hydrated.risks[0].quote_end == start + len(quote)
+
+
+def test_quote_repair_derives_a_verbatim_text_from_source_offsets(monkeypatch) -> None:
     contract_text = "乙方仅赔偿直接损失，不承担间接损失。"
     review = ReviewResponse(
         filename="contract.docx",
@@ -209,13 +237,13 @@ def test_quote_repair_only_accepts_verbatim_text_from_the_source_paragraph(monke
     class FakeCompletions:
         def create(self, **_: object):
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"original_text":"乙方仅赔偿直接损失"}]}'))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"quote_start":2,"quote_end":10}]}'))]
             )
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     repaired = openai_review.repair_unlocatable_risk_quotes(fake_client, review, contract_text)
 
-    assert repaired.risks[0].original_text == "乙方仅赔偿直接损失"
+    assert repaired.risks[0].original_text == contract_text[2:10]
     assert any("逐字校验" in warning for warning in repaired.warnings)
 
 
@@ -274,7 +302,7 @@ def test_unreferenced_risk_is_bound_by_a_unique_contract_quote() -> None:
     assert any("唯一匹配" in warning for warning in bound.warnings)
 
 
-def test_second_pass_recovers_paragraph_id_and_verbatim_quote() -> None:
+def test_second_pass_recovers_paragraph_id_and_derives_quote_from_offsets() -> None:
     paragraph = "乙方仅赔偿直接损失，不承担间接损失。"
     review = ReviewResponse(
         filename="contract.docx",
@@ -292,7 +320,7 @@ def test_second_pass_recovers_paragraph_id_and_verbatim_quote() -> None:
     class FakeCompletions:
         def create(self, **_: object):
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"clause_reference":"P003","original_text":"乙方仅赔偿直接损失"}]}'))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"matches":[{"risk_index":0,"clause_reference":"P003","quote_start":0,"quote_end":10}]}'))]
             )
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
@@ -304,7 +332,7 @@ def test_second_pass_recovers_paragraph_id_and_verbatim_quote() -> None:
 
     assert recovered.risks[0].clause_reference == "P003"
     assert recovered.risks[0].anchor_text == paragraph
-    assert recovered.risks[0].original_text == "乙方仅赔偿直接损失"
+    assert recovered.risks[0].original_text == paragraph[:10]
 
 
 def test_large_contract_is_split_and_merged(monkeypatch) -> None:

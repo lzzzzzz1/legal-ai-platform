@@ -1,5 +1,6 @@
 from app.schemas.review import ContractOverview, IntakeChatMessage, IntakeChatRequest, IntakeReviewCriteria
 from app.services.intake_chat import (
+    _IntakeModelOutputTruncated,
     _clean_quick_replies,
     _merge_criteria,
     _recover_assistant_message,
@@ -48,7 +49,7 @@ def test_intake_chat_fallback_builds_ready_criteria_from_free_text(monkeypatch) 
     assert response.criteria.party_role == "party_a"
     assert response.ready_for_review is True
     assert "十月" in response.criteria.business_context
-    assert response.quick_replies == []
+    assert response.quick_replies[0] == "按当前方案开始审查"
 
 
 def test_intake_chat_fallback_does_not_unlock_review_for_a_bare_role(monkeypatch) -> None:
@@ -139,6 +140,29 @@ def test_intake_chat_retries_parseable_but_wrong_model_shape(monkeypatch) -> Non
     assert attempts == [False, True]
     assert response.source == "model"
     assert response.ready_for_review is True
+
+
+def test_intake_chat_does_not_retry_a_truncated_model_turn(monkeypatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setattr("app.services.intake_chat.OpenAI", lambda **kwargs: object())
+    attempts: list[bool] = []
+
+    def fake_request(client, request, *, repair=False):
+        attempts.append(repair)
+        raise _IntakeModelOutputTruncated("provider stopped at token limit")
+
+    monkeypatch.setattr("app.services.intake_chat._request_model_turn", fake_request)
+    criteria = IntakeReviewCriteria(
+        party_role="party_a",
+        business_context="确保按期交付并完成验收",
+    )
+
+    response = continue_intake_chat(_request([], criteria))
+
+    assert attempts == [False]
+    assert response.source == "fallback"
+    assert response.ready_for_review is True
+    assert "回复过长" in (response.warning or "")
 
 
 def test_json_parser_tolerates_think_block_control_character_and_trailing_comma() -> None:

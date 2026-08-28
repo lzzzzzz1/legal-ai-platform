@@ -16,5 +16,8 @@ dist/
 outputs/
 work/
 backend/logs/
+backend/data/review_jobs.sqlite3
+backend/data/review_jobs.sqlite3-shm
+backend/data/review_jobs.sqlite3-wal
 logs/
 .pytest-runtime/

@@ -14,7 +14,6 @@ from app.services.openai_review import (
     BAILIAN_DEFAULT_BASE_URL,
     BAILIAN_DEFAULT_MODEL,
     _audit_review,
-    _json_mode_options,
     _model_content_to_text,
     _parse_json_content,
     _normalize_risk_fields,
@@ -28,6 +27,10 @@ from app.services.openai_review import (
 )
 from app.services.openai_review import MAX_CONTRACT_CHARS
 from app.services.document_preflight import PREFLIGHT_SCOPE, run_document_preflight
+
+
+DEEP_REVIEW_REPAIR_MAX_CONTRACT_CHARS = int(os.getenv("DEEP_REVIEW_REPAIR_MAX_CONTRACT_CHARS", "16000"))
+DEEP_REVIEW_REPAIR_MAX_OUTPUT_TOKENS = int(os.getenv("DEEP_REVIEW_REPAIR_MAX_OUTPUT_TOKENS", "2600"))
 
 
 DEEP_REVIEW_PROMPT = """你是企业法务的深度合同审核助手。适用中国法律；你的结论仅供内部法务初审，重大、涉外、跨境数据、医疗健康数据、监管敏感或高争议金额事项必须标注人工复核。
@@ -55,7 +58,7 @@ DEEP_REVIEW_PROMPT = """你是企业法务的深度合同审核助手。适用�
   "review_summary":"不超过500字的审查说明",
   "risks":[{
     "item":"检查项","level":"high|medium|low","original_text":"合同精确原文或【缺失该约定】","anchor_text":null,"insert_after_text":null,
-    "clause_reference":"P001 格式的合同段落编号；缺失条款则填最相关的插入锚点段落编号","risk":"风险及对我方影响","party_impact":"对我方影响","suggestion":"可直接写入合同的完整条文","minimum_acceptable_text":"最低可接受条文或空字符串","negotiation_level":"must_modify|negotiable|internal_approval|prohibited","laws":[]
+    "clause_reference":"P001 格式的合同段落编号；缺失条款则填最相关的插入锚点段落编号","quote_start":0,"quote_end":0,"risk":"风险及对我方影响","party_impact":"对我方影响","suggestion":"可直接写入合同的完整条文","minimum_acceptable_text":"最低可接受条文或空字符串","negotiation_level":"must_modify|negotiable|internal_approval|prohibited","laws":[]
   }],
   "deep_review":{
     "state":"completed","overall_conclusion":"可签|有条件可签|不建议签|待确认","executive_summary":"不超过500字","key_facts":[{"item":"付款","contract_term":"合同约定或合同未约定","conclusion":"审查结论/待确认"}],
@@ -66,7 +69,85 @@ DEEP_REVIEW_PROMPT = """你是企业法务的深度合同审核助手。适用�
   },
   "coverage":[]
 }
-合同正文会以 [P001] 形式标记段落编号。每个非缺失风险必须返回对应编号，original_text 必须逐字复制该编号后的合同原文，绝不能把 [P001] 编号写入 original_text。"""
+合同正文会以 [P001] 形式标记段落编号。每个非缺失风险必须返回对应编号及 quote_start/quote_end（段落内从 0 开始、前闭后开）；系统将从原文切片生成最终引文，绝不能把 [P001] 编号写入 original_text。"""
+
+
+def _build_deep_review(
+    content: str,
+    *,
+    filename: str,
+    contract_text: str,
+    duration_ms: int,
+) -> ReviewResponse:
+    """Parse only the model-owned deep-review payload before post-processing.
+
+    Keeping this boundary small lets us retry a malformed provider response
+    without repeating safe, deterministic localisation and preflight work.
+    """
+    payload = _parse_json_content(content)
+    if not isinstance(payload, dict):
+        raise ValueError("Deep review response must be a JSON object.")
+    payload["filename"] = filename
+    payload["contract_text"] = contract_text
+    payload["review_scope"] = ["深度商业与谈判审查"]
+    payload["review_method"] = "model"
+    payload["review_duration_ms"] = duration_ms
+    review = ReviewResponse(**_normalize_risk_fields(payload))
+    if review.deep_review is None or review.deep_review.state != "completed":
+        raise ValueError("Deep review did not return a completed structured result.")
+    if not review.review_summary.strip():
+        raise ValueError("Deep review did not return a review summary.")
+    return review
+
+
+def _request_compact_deep_review(
+    client: OpenAI,
+    *,
+    settings: DeepReviewSettings,
+    indexed_contract: str,
+) -> str:
+    """Retry once with a compact schema when a gateway corrupts long JSON.
+
+    Deliberately omit OpenAI ``response_format`` here. Some compatible
+    gateways advertise JSON mode but tokenise long Chinese JSON into invalid
+    fragments; the explicit prompt plus server-side validation is safer.
+    """
+    response = client.chat.completions.create(
+        model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是企业法务助手。仅返回一个合法 JSON 对象，不要 Markdown、思考过程或任何 JSON 外文字。"
+                    "每个风险必须引用合同原文，无法确认时使用【缺失该约定】。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "审查设置：" + json.dumps(settings.model_dump(), ensure_ascii=False)
+                    + "\n返回此固定结构："
+                    + '{"contract_type":"通用商务合同","review_summary":"简短审查说明",'
+                    + '"risks":[{"item":"检查项","level":"high|medium|low",'
+                    + '"original_text":"合同原文线索或【缺失该约定】","clause_reference":"P001或空字符串","quote_start":0,"quote_end":0,'
+                    + '"risk":"风险说明","party_impact":"对我方影响","suggestion":"可写入合同的条款",'
+                    + '"minimum_acceptable_text":"最低可接受条文或空字符串",'
+                    + '"negotiation_level":"must_modify|negotiable|internal_approval|prohibited","laws":[]}],'
+                    + '"deep_review":{"state":"completed","overall_conclusion":"可签|有条件可签|不建议签|待确认",'
+                    + '"executive_summary":"简短结论","key_facts":[],"missing_clauses":[],"negotiation_items":[],'
+                    + '"clarification_questions":[],"settings_note":""},"coverage":[]}'
+                    + "\n合同正文：\n" + indexed_contract[:DEEP_REVIEW_REPAIR_MAX_CONTRACT_CHARS]
+                ),
+            },
+        ],
+        temperature=0,
+        max_tokens=DEEP_REVIEW_REPAIR_MAX_OUTPUT_TOKENS,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    content = _model_content_to_text(response.choices[0].message.content)
+    if not content:
+        raise ValueError("Deep review compact retry returned an empty response.")
+    return content
 
 
 def review_contract_deeply(
@@ -110,7 +191,9 @@ def review_contract_deeply(
             temperature=0.1,
             max_tokens=int(os.getenv("BAILIAN_DEEP_REVIEW_MAX_OUTPUT_TOKENS", "5000")),
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            **_json_mode_options(),
+            # Do not enable response_format here. The configured compatible
+            # gateway corrupts large Chinese JSON while in forced JSON mode;
+            # the prompt and strict backend schema remain the source of truth.
         )
         content = _model_content_to_text(response.choices[0].message.content)
         if not content:
@@ -132,20 +215,41 @@ def review_contract_deeply(
         ) from exc
 
     try:
-        payload = _parse_json_content(content)
-        if not isinstance(payload, dict):
-            raise ValueError("Deep review response must be a JSON object.")
-        payload["filename"] = filename
-        payload["contract_text"] = contract_text
-        payload["review_scope"] = ["深度商业与谈判审查"]
-        payload["review_method"] = "model"
-        payload["review_duration_ms"] = round((perf_counter() - started_at) * 1000)
-        payload = _normalize_risk_fields(payload)
-        review = ReviewResponse(**payload)
-        if review.deep_review is None or review.deep_review.state != "completed":
-            raise ValueError("Deep review did not return a completed structured result.")
-        if not review.review_summary.strip():
-            raise ValueError("Deep review did not return a review summary.")
+        try:
+            review = _build_deep_review(
+                content,
+                filename=filename,
+                contract_text=contract_text,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+            )
+        except Exception as initial_error:
+            # The model often has useful reasoning but a gateway can corrupt
+            # its long response. Retry the original contract once using a much
+            # smaller response shape rather than exposing a false failure.
+            _audit_review(
+                filename=filename,
+                raw_response=content,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+                status="deep_review_compact_retry_started",
+                risk_count=0,
+                error=str(initial_error),
+            )
+            compact_content = _request_compact_deep_review(
+                client,
+                settings=settings,
+                indexed_contract=indexed_contract,
+            )
+            review = _build_deep_review(
+                compact_content,
+                filename=filename,
+                contract_text=contract_text,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+            )
+            content = content + "\n[compact_retry]\n" + compact_content
+            review.warnings = list(dict.fromkeys([
+                *review.warnings,
+                "模型首次返回格式异常，系统已使用简洁结构完成复核；建议继续人工核对全部修改。",
+            ]))
         review = hydrate_review_clause_references(review, paragraph_references)
         review = bind_review_risks_to_unique_paragraphs(review, paragraph_references)
         review = recover_unreferenced_risk_locations(client, review, paragraph_references)
@@ -216,5 +320,5 @@ def review_contract_deeply(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Deep review returned an incomplete result. Please retry the review; diagnostic details were recorded for administrators.",
+            detail="深度审查结果格式异常，系统未写入任何修改。已自动进行一次简洁复核仍未成功，请稍后重试；诊断信息已记录。",
         ) from exc

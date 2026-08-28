@@ -99,6 +99,36 @@ def test_deep_review_normalizes_string_coverage(monkeypatch) -> None:
     assert all(item.status == "checked" for item in response.coverage)
 
 
+def test_deep_review_retries_a_corrupt_primary_response_with_compact_schema(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{{"contract": broken'))])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=deep_review.json.dumps(_deep_payload(), ensure_ascii=False)))])
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("BAILIAN_RESPONSE_FORMAT", "json")
+    monkeypatch.setattr(deep_review, "OpenAI", FakeOpenAI)
+    response = deep_review.review_contract_deeply(
+        "甲方应在签约后支付全部费用。",
+        "contract.docx",
+        DeepReviewSettings(party_role="party_a"),
+    )
+
+    assert len(calls) == 2
+    assert "response_format" not in calls[0]
+    assert "response_format" not in calls[1]
+    assert response.deep_review is not None
+    assert any("简洁结构完成复核" in warning for warning in response.warnings)
+
+
 def test_deep_review_endpoint_forwards_settings(monkeypatch) -> None:
     captured = {}
 

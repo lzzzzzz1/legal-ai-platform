@@ -12,7 +12,7 @@ from fastapi import HTTPException, status
 from openai import OpenAI
 from pydantic import ValidationError
 
-from app.schemas.review import LawReference, ReviewCoverage, ReviewResponse
+from app.schemas.review import LawReference, ReviewCoverage, ReviewResponse, ReviewRisk
 from app.services.rag_service import format_laws_for_prompt, retrieve_relevant_laws
 from app.services.rule_review import RULE_TOPICS, run_rule_fallback
 from app.services.document_preflight import PREFLIGHT_SCOPE, run_document_preflight
@@ -64,8 +64,9 @@ SYSTEM_PROMPT = (
     "suggestion 字段只能填写可直接写回合同正文的条款文本本身，不得加入“建议修改如下”“引用某法第X条”等解释性语句。"
     "法律法规名称及条文号只能放在 laws 数组中，不得混入 suggestion。"
     "每个风险项必须包含 original_text 字段："
-    "  - 如果该条款在合同中存在对应文字，original_text 必须是合同原文中可精确定位的完整原句或短语，"
-    "    不得改写、增删标点符号、空格或换行，不得翻译，不得概括。"
+    "  - 如果该条款在合同中存在对应文字，必须返回 clause_reference（P001 格式）以及 quote_start、quote_end："
+    "    均以该段落首字符为起点，0 开始计数，start 包含、end 不包含。系统会据此直接从合同原文切出引用；"
+    "    original_text 仅作为辅助线索，不能作为唯一定位依据。"
     "  - 如果该条款在合同中完全缺失（即合同根本没有提及该内容），"
     "    original_text 必须设为固定值：【缺失该约定】，并尽量提供 insert_after_text。"
     "anchor_text 应尽量提供与风险相关的邻近标题、条款号或相邻原句，便于前端定位。"
@@ -124,6 +125,38 @@ def format_contract_with_paragraph_references(contract_text: str) -> tuple[str, 
     return "\n".join(indexed_lines) or contract_text, references
 
 
+def _source_span_from_match(paragraph: str, match: dict) -> tuple[str, int, int] | None:
+    """Derive a quote from server-owned source text, never from a model rewrite.
+
+    New locator responses provide offsets.  The verified legacy quote branch
+    remains for compatibility with already-configured models, but it is first
+    resolved to a source offset and then sliced back out of ``paragraph``.
+    """
+    start = match.get("quote_start")
+    end = match.get("quote_end")
+    if type(start) is int and type(end) is int and 0 <= start < end <= len(paragraph):
+        quote = paragraph[start:end]
+        if len(quote.strip()) >= 8:
+            return quote, start, end
+
+    legacy_quote = match.get("original_text")
+    if isinstance(legacy_quote, str):
+        quote = legacy_quote.strip()
+        start = paragraph.find(quote)
+        if len(quote) >= 8 and start >= 0:
+            end = start + len(quote)
+            return paragraph[start:end], start, end
+    return None
+
+
+def _set_risk_source_span(risk: ReviewRisk, paragraph: str, quote: str, start: int, end: int) -> None:
+    """Store only the exact slice obtained from the immutable paragraph map."""
+    risk.original_text = quote
+    risk.anchor_text = paragraph
+    risk.quote_start = start
+    risk.quote_end = end
+
+
 def hydrate_review_clause_references(review: ReviewResponse, references: dict[str, str]) -> ReviewResponse:
     """Attach an exact source-paragraph anchor for valid model paragraph IDs."""
     resolved = 0
@@ -145,9 +178,21 @@ def hydrate_review_clause_references(review: ReviewResponse, references: dict[st
             resolved += 1
             continue
 
-        # Keep a potentially paraphrased model quote untouched. The exact
-        # paragraph is only a safe locating anchor, never a fuzzy replacement.
         risk.anchor_text = paragraph
+        source_span = _source_span_from_match(
+            paragraph,
+            {
+                "quote_start": risk.quote_start,
+                "quote_end": risk.quote_end,
+                "original_text": original,
+            },
+        )
+        if source_span:
+            quote, start, end = source_span
+            _set_risk_source_span(risk, paragraph, quote, start, end)
+        # When a provider supplied only a paraphrase, retain the paragraph as
+        # the safe anchor. The narrow source-locator pass below can still
+        # derive a verified range; it never trusts the paraphrase itself.
         resolved += 1
         if original not in paragraph:
             mismatched_quotes += 1
@@ -272,10 +317,11 @@ def recover_unreferenced_risk_locations(
                     "role": "system",
                     "content": (
                         "You are a contract source locator. Return JSON only: "
-                        '{"matches":[{"risk_index":0,"clause_reference":"P001","original_text":""}]}. '
+                        '{"matches":[{"risk_index":0,"clause_reference":"P001","quote_start":0,"quote_end":0}]}. '
                         "For every risk, select exactly one supplied P-number only when that paragraph directly contains "
-                        "the contractual term being reviewed. original_text must be a continuous character-for-character "
-                        "substring from that selected paragraph; return an empty clause_reference when no reliable paragraph exists."
+                        "the contractual term being reviewed. Return zero-based quote_start (inclusive) and quote_end (exclusive) "
+                        "for one continuous source span. Do not return paraphrased quote text; return an empty clause_reference "
+                        "when no reliable paragraph exists."
                     ),
                 },
                 {
@@ -297,7 +343,6 @@ def recover_unreferenced_risk_locations(
                     continue
                 risk_index = match.get("risk_index")
                 reference_value = match.get("clause_reference")
-                quote = match.get("original_text")
                 if not isinstance(risk_index, int) or not isinstance(reference_value, str):
                     continue
                 if not 0 <= risk_index < len(review.risks):
@@ -312,8 +357,10 @@ def recover_unreferenced_risk_locations(
                 risk = review.risks[risk_index]
                 risk.clause_reference = reference
                 risk.anchor_text = paragraph
-                if isinstance(quote, str) and len(quote.strip()) >= 8 and quote.strip() in paragraph:
-                    risk.original_text = quote.strip()
+                source_span = _source_span_from_match(paragraph, match)
+                if source_span:
+                    quote, start, end = source_span
+                    _set_risk_source_span(risk, paragraph, quote, start, end)
                 recovered += 1
         if recovered:
             review.warnings = list(dict.fromkeys([
@@ -326,12 +373,12 @@ def recover_unreferenced_risk_locations(
 
 
 def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contract_text: str) -> ReviewResponse:
-    """Repair only model quotes that fail an exact source-text check.
+    """Repair only source locations that fail an exact source-text check.
 
     This second pass is intentionally narrow: it receives the already located
     source paragraph rather than the whole contract and may only return a
-    continuous, verbatim substring. The backend verifies the substring before
-    it can enable an automatic modification.
+    character range. The backend derives and verifies the substring before it
+    can enable an automatic modification.
     """
     targets = []
     missing_markers = {"【缺失该约定】", "缺失该约定"}
@@ -366,11 +413,11 @@ def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contr
                 {
                     "role": "system",
                     "content": (
-                        "You are an exact contract quote extractor. Return one JSON object only, with "
-                        '{"matches":[{"risk_index":0,"original_text":""}]}. '
-                        "For each item, original_text must be one continuous substring copied character-for-character "
-                        "from source_paragraph. Do not paraphrase, combine non-adjacent fragments, use ellipses, "
-                        "or return a clause number. Return an empty string if no reliable continuous quote exists."
+                        "You are an exact contract source-range locator. Return one JSON object only, with "
+                        '{"matches":[{"risk_index":0,"quote_start":0,"quote_end":0}]}. '
+                        "For each item, return a zero-based start (inclusive) and end (exclusive) for one continuous "
+                        "span in source_paragraph. Do not return quote text, paraphrases, ellipses, or a clause number. "
+                        "Return null offsets if no reliable continuous span exists."
                     ),
                 },
                 {"role": "user", "content": json.dumps({"targets": targets}, ensure_ascii=False)},
@@ -389,16 +436,16 @@ def repair_unlocatable_risk_quotes(client: OpenAI, review: ReviewResponse, contr
                 if not isinstance(match, dict):
                     continue
                 risk_index = match.get("risk_index")
-                quote = match.get("original_text")
-                if not isinstance(risk_index, int) or not isinstance(quote, str):
+                if not isinstance(risk_index, int):
                     continue
                 if not 0 <= risk_index < len(review.risks):
                     continue
-                quote = quote.strip()
                 risk = review.risks[risk_index]
                 anchor = (risk.anchor_text or "").strip()
-                if len(quote) >= 8 and quote in anchor and quote in contract_text:
-                    risk.original_text = quote
+                source_span = _source_span_from_match(anchor, match)
+                if source_span:
+                    quote, start, end = source_span
+                    _set_risk_source_span(risk, anchor, quote, start, end)
                     repaired += 1
                     repaired_indexes.add(risk_index)
         if repaired:

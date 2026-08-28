@@ -35,6 +35,10 @@ _CRITERIA_TEXT_LIMITS = {
     "non_negotiables": 2_000,
 }
 
+
+class _IntakeModelOutputTruncated(ValueError):
+    """A response stopped at the provider token limit and cannot be repaired safely."""
+
 INTAKE_PROMPT = """你是企业法务的审查前沟通助手。任务是先帮助用户用自然语言确定审查标准，再交给后续合同审查流程。
 你已获得合同概览和最近的对话。只能把用户明确表达的偏好、目标或底线写入 criteria；合同事实必须以概览或原文为准，不能编造。
 
@@ -222,6 +226,27 @@ def _contains_substantive_business_intent(message: str) -> bool:
     return len(normalized) >= 4
 
 
+def _is_question(message: str) -> bool:
+    return any(signal in message for signal in (
+        "？", "?", "什么", "如何", "为什么", "是否", "能否", "哪", "哪些", "多少", "请分析", "请解释", "请比较",
+    ))
+
+
+def _recover_unstructured_model_turn(content: str, request: IntakeChatRequest) -> dict[str, object] | None:
+    """Keep a readable contract answer when a compatible model ignores JSON."""
+    message = _recover_assistant_message(content)
+    if not message:
+        return None
+    fallback = _fallback_turn(request)
+    return {
+        "assistant_message": message,
+        "quick_replies": fallback.quick_replies,
+        "suggested_questions": fallback.suggested_questions,
+        "criteria": fallback.criteria.model_dump(),
+        "ready_for_review": fallback.ready_for_review,
+    }
+
+
 def _fallback_turn(request: IntakeChatRequest, reason: str | None = None) -> IntakeChatResponse:
     criteria = request.criteria
     user_messages = [message.content.strip() for message in request.messages if message.role == "user" and message.content.strip()]
@@ -233,7 +258,10 @@ def _fallback_turn(request: IntakeChatRequest, reason: str | None = None) -> Int
             payload.party_role = "party_a"
         elif any(token in combined for token in ("乙方", "供应方", "服务方", "卖方")):
             payload.party_role = "party_b"
-    if last_user_message and _contains_substantive_business_intent(last_user_message):
+    # Contract questions must be answered, not silently saved as a new review
+    # goal. The user's confirmed audit direction stays stable while discussing
+    # a particular clause.
+    if last_user_message and not _is_question(last_user_message) and _contains_substantive_business_intent(last_user_message):
         payload.business_context = "\n".join(filter(None, [payload.business_context, last_user_message]))[-2_000:]
         payload.additional_notes = [*payload.additional_notes, last_user_message][-5:]
     has_business_intent = bool(payload.business_context.strip() or payload.non_negotiables.strip() or payload.additional_notes)
@@ -248,7 +276,7 @@ def _fallback_turn(request: IntakeChatRequest, reason: str | None = None) -> Int
         suggested_questions = ["这份合同目前怎样约定交付和验收？", "付款条件与履约结果是否已经挂钩？"]
     elif ready:
         message = "我已记录您的立场与业务诉求。后续会把它们作为谈判偏好和审查标准，而不当作合同已约定事实。如无补充，可点击开始综合审查。"
-        quick_replies = []
+        quick_replies = ["按当前方案开始审查", "严格保护我方利益", "平衡合作与风险", "只提示重大问题"]
         suggested_questions = ["这份合同最值得优先修改的三处是什么？", "请展示关键风险条款的具体修改方案。", "哪些约定可能导致我方承担额外损失？"]
     else:
         message = "还有没有绝对不能接受的条件，例如付款、验收、数据使用、责任或退出安排？"
@@ -273,9 +301,10 @@ def _request_model_turn(client: OpenAI, request: IntakeChatRequest, *, repair: b
     context = {
         "合同概览": request.overview.model_dump(),
         "当前审查标准": request.criteria.model_dump(),
-        # Keep an intake turn quick while still letting the model verify the
-        # overview against the opening provisions of the actual contract.
-        "合同正文节选": _trim_contract_text(request.contract_text)[:12_000],
+        # Intake is about confirming the user's direction, not re-reviewing
+        # the entire document. A bounded excerpt keeps ordinary turns fast
+        # while the structured overview retains the key contract facts.
+        "合同正文节选": _trim_contract_text(request.contract_text)[:int(os.getenv("BAILIAN_INTAKE_CONTEXT_MAX_CHARS", "6000"))],
     }
     response = client.chat.completions.create(
         model=os.getenv("BAILIAN_MODEL", BAILIAN_DEFAULT_MODEL),
@@ -285,7 +314,7 @@ def _request_model_turn(client: OpenAI, request: IntakeChatRequest, *, repair: b
             *conversation,
         ],
         temperature=0.2,
-        max_tokens=int(os.getenv("BAILIAN_INTAKE_MAX_OUTPUT_TOKENS", "2200")),
+        max_tokens=int(os.getenv("BAILIAN_INTAKE_MAX_OUTPUT_TOKENS", "1600")),
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **_json_mode_options(),
     )
@@ -300,17 +329,16 @@ def _request_model_turn(client: OpenAI, request: IntakeChatRequest, *, repair: b
             finish_reason,
             len(content),
         )
+        recovered_turn = _recover_unstructured_model_turn(content, request)
+        if recovered_turn:
+            return recovered_turn
+        if finish_reason == "length":
+            # A second call with the same large conversation tends to time out
+            # again. Keep the user's confirmed direction and fall back
+            # immediately instead of making the UI wait through two failures.
+            raise _IntakeModelOutputTruncated("Intake model response was truncated.")
         if repair:
-            recovered_message = _recover_assistant_message(content)
-            if recovered_message:
-                fallback = _fallback_turn(request)
-                return {
-                    "assistant_message": recovered_message,
-                    "quick_replies": fallback.quick_replies,
-                    "suggested_questions": fallback.suggested_questions,
-                    "criteria": fallback.criteria.model_dump(),
-                    "ready_for_review": fallback.ready_for_review,
-                }
+            return None
         raise
 
 
@@ -338,6 +366,9 @@ def continue_intake_chat(request: IntakeChatRequest) -> IntakeChatResponse:
             payload = _request_model_turn(client, request)
             if not _payload_is_usable(payload):
                 raise ValueError("Model returned a parseable but unusable intake payload.")
+        except _IntakeModelOutputTruncated as exc:
+            logger.warning("Intake chat model response was truncated; using local guidance: %s", exc)
+            return _fallback_turn(request, "模型回复过长，已使用本地问答引导")
         except ValueError as exc:
             logger.warning("Intake chat model returned invalid output; retrying once: %s", exc)
             payload = _request_model_turn(client, request, repair=True)
@@ -352,13 +383,13 @@ def continue_intake_chat(request: IntakeChatRequest) -> IntakeChatResponse:
         criteria_complete = bool(criteria.party_role) and bool(
             criteria.business_context.strip() or criteria.non_negotiables.strip() or criteria.additional_notes
         )
-        previous_criteria_complete = bool(request.criteria.party_role) and bool(
-            request.criteria.business_context.strip()
-            or request.criteria.non_negotiables.strip()
-            or request.criteria.additional_notes
-        )
-        ready = criteria_complete and (bool(payload.get("ready_for_review")) or previous_criteria_complete)
+        # Once the necessary role and one business aim, concern or bottom line
+        # are known, the user must always be able to begin review. Optional
+        # follow-up questions may enrich the plan but cannot trap the workflow.
+        ready = criteria_complete
         quick_replies = _clean_quick_replies(payload.get("quick_replies"))
+        if not quick_replies and not criteria_complete:
+            quick_replies = _fallback_turn(request.model_copy(update={"criteria": criteria})).quick_replies
         suggested_questions = [
             question
             for question in _clean_quick_replies(payload.get("suggested_questions"))
